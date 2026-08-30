@@ -1,8 +1,5 @@
-python-telegram-bot==13.15
-cloudscraper==1.2.71
-beautifulsoup4==4.12.2
-fake-useragent==1.4.0
-requests==2.31.0
-flask==2.3.3
-lxml
-pyTelegramBotAPI
+flask==3.0.3
+requests==2.32.3
+pandas==2.2.2
+beautifulsoup4==4.12.3
+lxml==5.2.2
