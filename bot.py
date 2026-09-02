@@ -79,7 +79,7 @@ def telegram_send(message):
         return False
 
 # ============================================================
-# CLEAN URL BUILDER (بدون أفلييت)
+# CLEAN URL BUILDER
 # ============================================================
 def get_clean_url(url):
     """استخراج رابط المنتج المباشر بالنظام القياسي المباشر لـ ASIN"""
@@ -181,37 +181,87 @@ def extract_bestsellers_from_html(html):
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    cards = soup.select(".zg-grid-general-faceout, #zg-right-col .p13n-sc-unselected-item, div[id^='post-']")
+    # البحث عن حاويات المنتجات بجميع التنسيقات الممكنة في أمازون
+    cards = soup.select(
+        "div[id^='post-'], "
+        "div[class*='zg-grid-general-faceout'], "
+        "div[class*='p13n-sc-unselected-item'], "
+        "div.zg-carousel-general-faceout, "
+        "div[data-component-type='s-search-result'], "
+        "div.p13n-sc-shoveler div[class*='a-cardui']"
+    )
+
     if not cards:
-        cards = soup.find_all("div", attrs={"data-component-type": "s-search-result"})
+        cards = soup.select("div.a-section.p13n-asin, div[data-asin]")
+
+    logger.info(f"HTML Cards found: {len(cards)}")
 
     for card in cards:
         try:
-            name_tag = card.select_one("span.zg-text-js-truncate, ._cDE1C_truncate_3qMTh, h2 span, .a-size-base-plus")
-            name = name_tag.get_text(strip=True) if name_tag else None
+            # 1. استخراج الاسم
+            name = None
+            for selector in [
+                "span.zg-text-js-truncate",
+                "div._cDE1C_truncate_3qMTh",
+                "a.a-link-normal span",
+                "h2 span",
+                "div[class*='p13n-sc-css-line-clamp']",
+                ".a-size-base-plus",
+                "span.a-size-medium"
+            ]:
+                tag = card.select_one(selector)
+                if tag and len(tag.get_text(strip=True)) > 3:
+                    name = tag.get_text(strip=True)
+                    break
 
-            price_tag = card.select_one("._cDE1C_p13n-sc-price_3m33M, .a-price .a-offscreen, .a-price-whole")
-            price = parse_price(price_tag.get_text(strip=True)) if price_tag else None
+            # 2. استخراج السعر
+            price = None
+            for selector in [
+                "span._cDE1C_p13n-sc-price_3m33M",
+                "span.a-price span.a-offscreen",
+                "span.a-price-whole",
+                "span.p13n-sc-price",
+                "span.a-color-price"
+            ]:
+                tag = card.select_one(selector)
+                if tag:
+                    price = parse_price(tag.get_text(strip=True))
+                    if price and price > 0:
+                        break
 
-            link_tag = card.select_one("a.a-link-normal")
-            raw_url = "https://www.amazon.sa" + link_tag["href"] if link_tag and link_tag.get("href") else None
+            # 3. استخراج الرابط والـ ASIN
+            raw_url = None
+            link_tag = card.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/product/']")
+            if not link_tag:
+                link_tag = card.select_one("a.a-link-normal")
+
+            if link_tag and link_tag.get("href"):
+                href = link_tag["href"]
+                raw_url = "https://www.amazon.sa" + href if href.startswith("/") else href
 
             if name and price and price > 0 and raw_url:
                 clean_url = get_clean_url(raw_url)
                 
                 asin_match = re.search(r"/(dp|gp/product)/([A-Z0-9]{10})", raw_url)
-                product_id = asin_match.group(2) if asin_match else hashlib.md5(raw_url.encode()).hexdigest()[:16]
+                if asin_match:
+                    product_id = asin_match.group(2)
+                else:
+                    product_id = card.get("data-asin") or hashlib.md5(raw_url.encode()).hexdigest()[:16]
 
                 products.append({
                     "product_id": product_id,
-                    "product": name[:180],
+                    "product": str(name).strip()[:180],
                     "url": clean_url,
                     "price": price
                 })
         except Exception:
             continue
 
-    return products
+    unique_in_page = {}
+    for p in products:
+        unique_in_page[p["product_id"]] = p
+
+    return list(unique_in_page.values())
 
 # ============================================================
 # PROCESSING & GLITCH SCAN
