@@ -23,8 +23,12 @@ CHAT_ID = "432826122"
 # 🔑 ScraperAPI Key
 SCRAPER_API_KEY = "f56b509d66fa5a0f2b234473858004b7"
 
+# 🎟️ إعدادات كود الخصم الإضافي
+PROMO_CODE = "SAVE10"          # كود الخصم الإضافي
+PROMO_DISCOUNT_PERCENT = 10.0  # نسبة الخصم الإضافي (%)
+
 # إعدادات الفحص والتنبيه
-MIN_DISCOUNT_PERCENT = 25.0  # الحد الأدنى لنسبة الخصم المقبولة (25%)
+MIN_DISCOUNT_PERCENT = 25.0  # الحد الأدنى لإجمالي نسبة الخصم المقبولة (25%)
 MIN_HISTORY = 1             # عدد مرات تسجيل السعر السابقة للتأكد من الخصم
 MAX_PRODUCTS = 300
 REQUEST_DELAY = 2.0
@@ -290,17 +294,22 @@ def process_and_check_deals(discovered_products):
             ref_price = float(old_prices.median())
 
             if ref_price > current_price:
-                discount = ((ref_price - current_price) / ref_price) * 100
+                # حساب السعر بعد تطبيق كود الخصم الإضافي
+                final_price = round(current_price * (1 - (PROMO_DISCOUNT_PERCENT / 100.0)), 2)
                 
-                if discount >= MIN_DISCOUNT_PERCENT:
-                    alert_id = f"{pid}_{current_price}_{round(discount)}"
+                # حساب إجمالي نسبة الخصم من السعر المرجعي إلى السعر النهائي
+                total_discount = ((ref_price - final_price) / ref_price) * 100
+
+                if total_discount >= MIN_DISCOUNT_PERCENT:
+                    alert_id = f"{pid}_{final_price}_{round(total_discount)}"
                     if alert_id not in sent_alerts:
                         alerts_to_send.append({
                             "alert_id": alert_id,
                             "product": item["product"],
-                            "current_price": current_price,
+                            "site_price": current_price,
+                            "final_price": final_price,
                             "ref_price": ref_price,
-                            "discount": round(discount, 1),
+                            "discount": round(total_discount, 1),
                             "url": item["url"]
                         })
 
@@ -336,9 +345,11 @@ def run_scan():
         msg = (
             "🔥 <b>صيدة جديدة من الأكثر مبيعاً (Best Seller)!</b> 🔥\n\n"
             f"🛍 <b>المنتج:</b> {deal['product']}\n"
-            f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
-            f"📈 <b>السعر السابق:</b> {deal['ref_price']} ر.س\n"
-            f"💥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
+            f"🏷 <b>السعر في الموقع:</b> {deal['site_price']} ر.س\n"
+            f"💳 <b>السعر بعد كود الخصم:</b> {deal['final_price']} ر.س\n"
+            f"📈 <b>السعر الأصلي:</b> {deal['ref_price']} ر.س\n"
+            f"💥 <b>إجمالي نسبة الخصم:</b> {deal['discount']}%\n\n"
+            f"📌 <b>بعد استخدام كود الخصم:</b> <code>{PROMO_CODE}</code>\n"
             f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
         )
         if telegram_send(msg):
