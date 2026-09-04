@@ -23,9 +23,12 @@ CHAT_ID = "432826122"
 # 🔑 ScraperAPI Key
 SCRAPER_API_KEY = "f56b509d66fa5a0f2b234473858004b7"
 
+# 🎟️ إعدادات كود الخصم الإضافي (البرومو كود)
+PROMO_CODE = "SAVE10"          # اكتب هنا رمز كود الخصم (مثلاً: SAVE10)
+PROMO_DISCOUNT_PERCENT = 10.0  # اكتب هنا نسبة خصم الكود (مثلاً: 10 أو 15 أو 20)
+
 # إعدادات الفحص والتنبيه
-MIN_DISCOUNT_PERCENT = 25.0  # الحد الأدنى لنسبة الخصم المقبولة (25%)
-MIN_HISTORY = 1             # عدد مرات تسجيل السعر السابقة للتأكد من الخصم
+MIN_DISCOUNT_PERCENT = 5.0   # الحد الأدنى لخصم البرومو كود لإرسال التنبيه
 MAX_PRODUCTS = 300
 REQUEST_DELAY = 2.0
 SCAN_INTERVAL_MINUTES = 60
@@ -82,7 +85,7 @@ def telegram_send(message):
 # CLEAN URL BUILDER
 # ============================================================
 def get_clean_url(url):
-    """استخراج رابط المنتج المباشر بالنظام القياسي المباشر لـ ASIN"""
+    """استخراج رابط المنتج المباشر"""
     asin_match = re.search(r"/(dp|gp/product)/([A-Z0-9]{10})", url)
     if asin_match:
         asin = asin_match.group(2)
@@ -152,7 +155,6 @@ def parse_price(value):
         return None
 
 def fetch_direct(url, retries=2):
-    """جلب الصفحة من خلال ScraperAPI لتجاوز الحظر كلياً"""
     payload = {
         'api_key': SCRAPER_API_KEY,
         'url': url,
@@ -181,7 +183,6 @@ def extract_bestsellers_from_html(html):
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    # البحث عن حاويات المنتجات بجميع التنسيقات الممكنة في أمازون
     cards = soup.select(
         "div[id^='post-'], "
         "div[class*='zg-grid-general-faceout'], "
@@ -214,8 +215,8 @@ def extract_bestsellers_from_html(html):
                     name = tag.get_text(strip=True)
                     break
 
-            # 2. استخراج السعر
-            price = None
+            # 2. استخراج السعر الظاهر في الصفحة
+            page_price = None
             for selector in [
                 "span._cDE1C_p13n-sc-price_3m33M",
                 "span.a-price span.a-offscreen",
@@ -225,11 +226,11 @@ def extract_bestsellers_from_html(html):
             ]:
                 tag = card.select_one(selector)
                 if tag:
-                    price = parse_price(tag.get_text(strip=True))
-                    if price and price > 0:
+                    page_price = parse_price(tag.get_text(strip=True))
+                    if page_price and page_price > 0:
                         break
 
-            # 3. استخراج الرابط والـ ASIN
+            # 3. استخراج الرابط
             raw_url = None
             link_tag = card.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/product/']")
             if not link_tag:
@@ -239,7 +240,7 @@ def extract_bestsellers_from_html(html):
                 href = link_tag["href"]
                 raw_url = "https://www.amazon.sa" + href if href.startswith("/") else href
 
-            if name and price and price > 0 and raw_url:
+            if name and page_price and page_price > 0 and raw_url:
                 clean_url = get_clean_url(raw_url)
                 
                 asin_match = re.search(r"/(dp|gp/product)/([A-Z0-9]{10})", raw_url)
@@ -252,7 +253,7 @@ def extract_bestsellers_from_html(html):
                     "product_id": product_id,
                     "product": str(name).strip()[:180],
                     "url": clean_url,
-                    "price": price
+                    "page_price": page_price
                 })
         except Exception:
             continue
@@ -264,7 +265,7 @@ def extract_bestsellers_from_html(html):
     return list(unique_in_page.values())
 
 # ============================================================
-# PROCESSING & GLITCH SCAN
+# PROCESSING & NEW PRICE CALCULATION
 # ============================================================
 def process_and_check_deals(discovered_products):
     global prices
@@ -272,37 +273,35 @@ def process_and_check_deals(discovered_products):
 
     for item in discovered_products:
         pid = item["product_id"]
-        current_price = item["price"]
+        page_price = item["page_price"]  # السعر المعروض في الصفحة
 
+        # حفظ السعر في قاعدة البيانات
         new_row = pd.DataFrame([{
             "product_id": pid,
             "product": item["product"],
             "url": item["url"],
-            "price": current_price,
+            "price": page_price,
             "timestamp": datetime.now()
         }])
         prices = pd.concat([prices, new_row], ignore_index=True)
 
-        prod_history = prices[prices["product_id"] == pid].sort_values("timestamp")
-        
-        if len(prod_history) >= (MIN_HISTORY + 1):
-            old_prices = prod_history["price"].iloc[:-1].astype(float)
-            ref_price = float(old_prices.median())
+        # 🧮 1. حساب قيمة الخصم المالي للبرومو كود
+        discount_amount = round(page_price * (PROMO_DISCOUNT_PERCENT / 100.0), 2)
 
-            if ref_price > current_price:
-                discount = ((ref_price - current_price) / ref_price) * 100
-                
-                if discount >= MIN_DISCOUNT_PERCENT:
-                    alert_id = f"{pid}_{current_price}_{round(discount)}"
-                    if alert_id not in sent_alerts:
-                        alerts_to_send.append({
-                            "alert_id": alert_id,
-                            "product": item["product"],
-                            "current_price": current_price,
-                            "ref_price": ref_price,
-                            "discount": round(discount, 1),
-                            "url": item["url"]
-                        })
+        # 🧮 2. حساب السعر الجديد الصافي بعد إعمال كود الخصم
+        new_final_price = round(page_price - discount_amount, 2)
+
+        # تجهيز معرف التنبيه لمنع التكرار
+        alert_id = f"{pid}_{new_final_price}"
+        if alert_id not in sent_alerts:
+            alerts_to_send.append({
+                "alert_id": alert_id,
+                "product": item["product"],
+                "page_price": page_price,          # السعر المعروض بصفحة الموقع
+                "discount_amount": discount_amount, # قيمة الخصم
+                "new_final_price": new_final_price, # السعر الجديد الفعلي
+                "url": item["url"]
+            })
 
     return alerts_to_send
 
@@ -334,11 +333,12 @@ def run_scan():
 
     for deal in deals:
         msg = (
-            "🔥 <b>صيدة جديدة من الأكثر مبيعاً (Best Seller)!</b> 🔥\n\n"
+            "🎉 <b>سعر جديد بعد تطبيق كود الخصم!</b> 🎉\n\n"
             f"🛍 <b>المنتج:</b> {deal['product']}\n"
-            f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
-            f"📈 <b>السعر السابق:</b> {deal['ref_price']} ر.س\n"
-            f"💥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
+            f"💵 <b>السعر في الصفحة:</b> {deal['page_price']} ر.س\n"
+            f"✂️ <b>قيمة الخصم:</b> -{deal['discount_amount']} ر.س (خصم {PROMO_DISCOUNT_PERCENT}%)\n"
+            f"🔥 <b>السعر الجديد بعد استخدام الكود:</b> <code>{deal['new_final_price']}</code> ر.س\n\n"
+            f"📌 <b>استخدم كود الخصم:</b> <code>{PROMO_CODE}</code> عند الدفع\n"
             f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
         )
         if telegram_send(msg):
@@ -376,7 +376,7 @@ def self_ping():
 def home():
     return jsonify({
         "status": "online",
-        "bot": "Amazon SA Best Sellers Hunter",
+        "bot": "Amazon SA Promo Price Calculator",
         "tracked_products": len(prices["product_id"].unique()) if not prices.empty else 0
     })
 
