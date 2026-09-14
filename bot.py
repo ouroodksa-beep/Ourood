@@ -24,7 +24,7 @@ CHAT_ID = os.environ.get("CHAT_ID", "432826122")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 
 # إعدادات الفحص والتنبيه
-MIN_DISCOUNT_PERCENT = 80.0  # نسبة الخصم المطلوبة (80%)
+MIN_DISCOUNT_PERCENT = 70.0  # نسبة الخصم المطلوبة (70%)
 REQUEST_DELAY = 1.0
 SCAN_INTERVAL_MINUTES = 60
 PRICE_FILE = "amazon_sa_prices.csv"
