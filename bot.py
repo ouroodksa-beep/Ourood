@@ -27,7 +27,7 @@ SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890
 MIN_DISCOUNT_PERCENT = 80.0  # نسبة الخصم المطلوبة (80%)
 MIN_HISTORY = 1             # عدد مرات تسجيل السعر السابقة للتأكد من الخصم
 MAX_PRODUCTS = 300
-REQUEST_DELAY = 3.0
+REQUEST_DELAY = 2.0
 SCAN_INTERVAL_MINUTES = 60
 PRICE_FILE = "amazon_sa_prices.csv"
 ALERT_FILE = "amazon_sa_alerts.csv"
@@ -125,7 +125,7 @@ def save_database():
 load_database()
 
 # ============================================================
-# FETCH VIA SCRAPERAPI & PARSE (FIXED SCRAPERAPI CALL)
+# FETCH VIA SCRAPERAPI & PARSE
 # ============================================================
 def parse_price(value):
     if value is None:
@@ -152,29 +152,33 @@ def parse_price(value):
         return None
 
 def fetch_direct(target_url, retries=2):
-    """جلب الصفحة عبر ScraperAPI مع تفعيل JS Rendering لمنع الكابتشا وتجاوز حظر أمازون"""
     payload = {
         'api_key': SCRAPER_API_KEY,
         'url': target_url,
         'country_code': 'sa',
         'device_type': 'desktop',
-        'render': 'true'  # تفعيل تشغيل الجافاسكربت لتخطي صفحة الكابتشا
+        'keep_headers': 'true'
+    }
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7'
     }
     
     for attempt in range(retries + 1):
         try:
             logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {target_url}")
-            resp = session.get('http://api.scraperapi.com', params=payload, timeout=90)
+            resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=60)
             
             if resp.status_code == 200 and len(resp.text) > 5000:
                 logger.info(f"Successfully fetched | Length: {len(resp.text)}")
                 return resp.text
             
-            logger.warning(f"ScraperAPI Status Code: {resp.status_code}")
-            time.sleep(4)
+            logger.warning(f"ScraperAPI status: {resp.status_code}")
+            time.sleep(3)
         except Exception as e:
             logger.warning(f"Fetch error: {e}")
-            time.sleep(4)
+            time.sleep(3)
             
     return None
 
@@ -182,7 +186,7 @@ def extract_bestsellers_from_html(html):
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    # التحديد المرن لعناصر أمازون السعودية بأحدث الهياكل
+    # محدث بالكامل لاختيار كافة أنواع الكروت في تصميم أمازون الجديد
     cards = soup.select(
         "div[id^='post-'], "
         "div[class*='zg-grid-general-faceout'], "
@@ -191,11 +195,9 @@ def extract_bestsellers_from_html(html):
         "div[data-component-type='s-search-result'], "
         "div.p13n-sc-shoveler div[class*='a-cardui'], "
         "div[data-asin], "
+        "div.p13n-grid-content, "
         "li.zg-item-immersion"
     )
-
-    if not cards:
-        cards = soup.select("div.a-section.p13n-asin")
 
     logger.info(f"HTML Cards found: {len(cards)}")
 
@@ -204,14 +206,14 @@ def extract_bestsellers_from_html(html):
             # 1. استخراج الاسم
             name = None
             for selector in [
-                "span.zg-text-js-truncate",
                 "div._cDE1C_truncate_3qMTh",
+                "span.zg-text-js-truncate",
                 "a.a-link-normal span",
                 "h2 span",
                 "div[class*='p13n-sc-css-line-clamp']",
                 ".a-size-base-plus",
                 "span.a-size-medium",
-                "div._p13n-zg-list-grid-desktop_truncationStyle_p13n-sc-css-line-clamp__1p21s"
+                "div[class*='_p13n-zg-list-grid-desktop_truncationStyle_']"
             ]:
                 tag = card.select_one(selector)
                 if tag and len(tag.get_text(strip=True)) > 3:
@@ -225,7 +227,8 @@ def extract_bestsellers_from_html(html):
                 "span.a-price span.a-offscreen",
                 "span.a-price-whole",
                 "span.p13n-sc-price",
-                "span.a-color-price"
+                "span.a-color-price",
+                "span[class*='p13n-sc-price']"
             ]:
                 tag = card.select_one(selector)
                 if tag:
