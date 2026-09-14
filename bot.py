@@ -25,15 +25,13 @@ SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890
 
 # إعدادات الفحص والتنبيه
 MIN_DISCOUNT_PERCENT = 80.0  # نسبة الخصم المطلوبة (80%)
-MAX_PRODUCTS = 300
-REQUEST_DELAY = 2.0
+REQUEST_DELAY = 1.0
 SCAN_INTERVAL_MINUTES = 60
 PRICE_FILE = "amazon_sa_prices.csv"
 ALERT_FILE = "amazon_sa_alerts.csv"
 SELF_PING_INTERVAL = 600
 
-# متغير لمتابعة الفحص المباشر وإلغاء أي فحص سابق لو انطلب فحص جديد
-current_scan_id = 0
+is_scanning = False
 scan_lock = threading.Lock()
 
 # ============================================================
@@ -45,9 +43,7 @@ DISCOVERY_URLS = [
     "https://www.amazon.sa/gp/bestsellers/computers",
     "https://www.amazon.sa/gp/bestsellers/kitchen",
     "https://www.amazon.sa/gp/bestsellers/beauty",
-    "https://www.amazon.sa/gp/bestsellers/supermarket",
-    "https://www.amazon.sa/gp/movers-and-shakers/electronics",
-    "https://www.amazon.sa/gp/movers-and-shakers/mobile-phones"
+    "https://www.amazon.sa/gp/bestsellers/supermarket"
 ]
 
 # ============================================================
@@ -74,7 +70,7 @@ def telegram_send(message):
         r = session.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML", "disable_web_page_preview": False},
-            timeout=20
+            timeout=15
         )
         return r.status_code == 200 and r.json().get("ok")
     except Exception as e:
@@ -153,7 +149,7 @@ def parse_price(value):
     except Exception:
         return None
 
-def fetch_direct(target_url, retries=2):
+def fetch_direct(target_url, retries=1):
     payload = {
         'api_key': SCRAPER_API_KEY,
         'url': target_url,
@@ -170,18 +166,17 @@ def fetch_direct(target_url, retries=2):
     for attempt in range(retries + 1):
         try:
             logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {target_url}")
-            # رفع مهلة الانتظار لـ 90 ثانية لمنع خطأ Timeout
-            resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=90)
+            # تقليل مهلة الانتظار لـ 30 ثانية لتفادي التأخير الطويل
+            resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=30)
             
             if resp.status_code == 200 and len(resp.text) > 5000:
                 logger.info(f"Successfully fetched | Length: {len(resp.text)}")
                 return resp.text
             
-            logger.warning(f"ScraperAPI status: {resp.status_code}")
-            time.sleep(2)
+            time.sleep(1)
         except Exception as e:
             logger.warning(f"Fetch error: {e}")
-            time.sleep(2)
+            time.sleep(1)
             
     return None
 
@@ -203,7 +198,6 @@ def extract_bestsellers_from_html(html):
 
     for card in cards:
         try:
-            # 1. الاسم
             name = None
             for selector in [
                 "div._cDE1C_truncate_3qMTh",
@@ -219,7 +213,6 @@ def extract_bestsellers_from_html(html):
                     name = tag.get_text(strip=True)
                     break
 
-            # 2. السعر الحالي
             price = None
             for selector in [
                 "span._cDE1C_p13n-sc-price_3m33M",
@@ -234,7 +227,6 @@ def extract_bestsellers_from_html(html):
                     if price and price > 0:
                         break
 
-            # 3. السعر المشطوب (إن وجد)
             old_price = None
             for selector in [
                 "span.a-text-price span.a-offscreen",
@@ -248,7 +240,6 @@ def extract_bestsellers_from_html(html):
                         old_price = parsed_old
                         break
 
-            # 4. الرابط والـ ASIN
             raw_url = None
             link_tag = card.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/product/']")
             if not link_tag:
@@ -280,7 +271,7 @@ def extract_bestsellers_from_html(html):
     return list(unique_in_page.values())
 
 # ============================================================
-# PROCESSING & GLITCH SCAN
+# PROCESSING DEALS
 # ============================================================
 def process_and_check_deals(discovered_products):
     global prices
@@ -290,7 +281,6 @@ def process_and_check_deals(discovered_products):
         pid = item["product_id"]
         current_price = item["price"]
 
-        # تسجيل السعر لبناء السجل والتاريخ
         new_row = pd.DataFrame([{
             "product_id": pid,
             "product": item["product"],
@@ -327,76 +317,73 @@ def process_and_check_deals(discovered_products):
     return alerts_to_send
 
 def run_scan():
-    global current_scan_id
+    global is_scanning
     
+    if is_scanning:
+        logger.info("Scan is already in progress, skipping duplicate request.")
+        return 0
+
     with scan_lock:
-        current_scan_id += 1
-        my_scan_id = current_scan_id
+        is_scanning = True
 
-    logger.info("=" * 60)
-    logger.info(f"STARTING AMAZON SA SCAN (Scan ID: {my_scan_id})")
-    logger.info("=" * 60)
+    try:
+        logger.info("=" * 60)
+        logger.info("STARTING QUICK AMAZON SA SCAN")
+        logger.info("=" * 60)
 
-    all_discovered = []
+        all_discovered = []
 
-    for url in DISCOVERY_URLS:
-        # إلغاء الفحص لو انطلب فحص جديد بإرسال /scan
-        if my_scan_id != current_scan_id:
-            logger.info(f"Scan ID {my_scan_id} cancelled in favor of new Scan ID {current_scan_id}")
+        for url in DISCOVERY_URLS:
+            html = fetch_direct(url)
+            if html:
+                items = extract_bestsellers_from_html(html)
+                all_discovered.extend(items)
+                logger.info(f"Extracted {len(items)} items from: {url}")
+            time.sleep(REQUEST_DELAY)
+
+        if not all_discovered:
+            logger.warning("No products found across all URLs.")
+            telegram_send("⚠️ <b>انتهى الفحص:</b> لم يتم العثور على منتجات جديدة.")
             return 0
 
-        html = fetch_direct(url)
-        if html:
-            items = extract_bestsellers_from_html(html)
-            all_discovered.extend(items)
-            logger.info(f"Extracted {len(items)} items from: {url}")
-        time.sleep(REQUEST_DELAY)
+        unique_products = list({p["product_id"]: p for p in all_discovered}.values())
+        logger.info(f"Unique products extracted: {len(unique_products)}")
 
-    if my_scan_id != current_scan_id:
-        return 0
+        deals = process_and_check_deals(unique_products)
+        save_database()
 
-    if not all_discovered:
-        logger.warning("No products found across all URLs.")
-        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات في هذا الفحص.")
-        return 0
+        if deals:
+            for deal in deals:
+                msg = (
+                    "💥 <b>صيدة جديدة بنسبة خصم خيالية (80%+)!</b> 💥\n\n"
+                    f"🛍 <b>المنتج:</b> {deal['product']}\n"
+                    f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
+                    f"📈 <b>السعر المرجعي:</b> {deal['ref_price']} ر.س\n"
+                    f"🔥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
+                    f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
+                )
+                if telegram_send(msg):
+                    sent_alerts.add(deal["alert_id"])
+                    save_database()
+                    time.sleep(1)
+        else:
+            telegram_send(f"✅ <b>اكتمل الفحص بنجاح!</b>\nتم فحص <b>{len(unique_products)}</b> منتج، ولا توجد خصومات مطابقة لشرط الخصم (80%) حالياً.")
 
-    unique_products = list({p["product_id"]: p for p in all_discovered}.values())
-    logger.info(f"Unique products extracted: {len(unique_products)}")
-
-    deals = process_and_check_deals(unique_products)
-    save_database()
-
-    for deal in deals:
-        if my_scan_id != current_scan_id:
-            return 0
-
-        msg = (
-            "💥 <b>صيدة جديدة بنسبة خصم خيالية (80%+)!</b> 💥\n\n"
-            f"🛍 <b>المنتج:</b> {deal['product']}\n"
-            f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
-            f"📈 <b>السعر المرجعي:</b> {deal['ref_price']} ر.س\n"
-            f"🔥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
-            f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
-        )
-        if telegram_send(msg):
-            sent_alerts.add(deal["alert_id"])
-            save_database()
-            time.sleep(1)
-
-    logger.info(f"Scan {my_scan_id} finished. New deals sent: {len(deals)}")
-    return len(deals)
+        logger.info(f"Scan finished. New deals sent: {len(deals)}")
+        return len(deals)
+    finally:
+        is_scanning = False
 
 # ============================================================
 # TELEGRAM COMMAND LISTENER (/scan)
 # ============================================================
 def telegram_listener():
-    """الاستماع لرستئل تليجرام وبدء الفحص فور استلام الأمر /scan"""
     last_update_id = 0
     while True:
         try:
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-            params = {"offset": last_update_id + 1, "timeout": 30}
-            resp = session.get(url, params=params, timeout=35)
+            params = {"offset": last_update_id + 1, "timeout": 20}
+            resp = session.get(url, params=params, timeout=25)
             
             if resp.status_code == 200:
                 data = resp.json()
@@ -407,11 +394,14 @@ def telegram_listener():
                         text = message.get("text", "").strip()
 
                         if text == "/scan" or text.startswith("/scan@"):
-                            telegram_send("⚡️ <b>تم استلام الأمر! جاري إيقاف الفحص الحالي وبدء فحص جديد فوراً...</b>")
-                            threading.Thread(target=run_scan, daemon=True).start()
+                            if is_scanning:
+                                telegram_send("⏳ <b>جاري الفحص بالفعل حالياً، يرجى الانتظار لحين الانتهاء...</b>")
+                            else:
+                                telegram_send("⚡️ <b>بدأ الفحص الشامل وسريع الآن، سيتم إرسال ملخص فور الانتهاء...</b>")
+                                threading.Thread(target=run_scan, daemon=True).start()
         except Exception as e:
             logger.error(f"Telegram listener error: {e}")
-        time.sleep(3)
+        time.sleep(2)
 
 # ============================================================
 # BACKGROUND SCHEDULER & KEEP-ALIVE
@@ -419,7 +409,8 @@ def telegram_listener():
 def background_scanner():
     while True:
         try:
-            run_scan()
+            if not is_scanning:
+                run_scan()
         except Exception as e:
             logger.error(f"Error in background scan: {e}")
         time.sleep(SCAN_INTERVAL_MINUTES * 60)
@@ -440,7 +431,7 @@ def self_ping():
 def home():
     return jsonify({
         "status": "online",
-        "bot": "Amazon SA Best Sellers Hunter (80%+ Discounts)",
+        "is_scanning": is_scanning,
         "tracked_products": len(prices["product_id"].unique()) if not prices.empty else 0
     })
 
@@ -450,18 +441,17 @@ def ping():
 
 @app.route("/scan")
 def manual_scan():
-    threading.Thread(target=run_scan, daemon=True).start()
-    return jsonify({"status": "success", "message": "New scan started"})
+    if not is_scanning:
+        threading.Thread(target=run_scan, daemon=True).start()
+        return jsonify({"status": "started", "message": "Scan started"})
+    return jsonify({"status": "busy", "message": "Scan already running"})
 
 # ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
-    # رسالة تأكيدية عند التشغيل
-    telegram_send("🚀 <b>تم تشغيل السكربت بنجاح! يمكنك إرسال /scan بأي وقت لبدء الفحص فوراً.</b>")
+    telegram_send("🚀 <b>السيرفر جاهز! أرسلي /scan للبدء الفوري.</b>")
     
-    # تشغيل الفحص الأولي ومستمع أوامر تليجرام
-    threading.Thread(target=run_scan, daemon=True).start()
     threading.Thread(target=telegram_listener, daemon=True).start()
     threading.Thread(target=background_scanner, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
