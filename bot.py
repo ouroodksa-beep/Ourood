@@ -17,14 +17,14 @@ from bs4 import BeautifulSoup
 # ============================================================
 # SETTINGS & CONFIGURATION
 # ============================================================
-BOT_TOKEN = "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA"
-CHAT_ID = "432826122"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
+CHAT_ID = os.environ.get("CHAT_ID", "432826122")
 
-# 🔑 ScraperAPI Key
-SCRAPER_API_KEY = "f56b509d66fa5a0f2b234473858004b7"
+# 🔑 ScraperAPI Key الجديد
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 
 # إعدادات الفحص والتنبيه
-MIN_DISCOUNT_PERCENT = 25.0  # الحد الأدنى لنسبة الخصم المقبولة (25%)
+MIN_DISCOUNT_PERCENT = 80.0  # نسبة الخصم المطلوبة (80%)
 MIN_HISTORY = 1             # عدد مرات تسجيل السعر السابقة للتأكد من الخصم
 MAX_PRODUCTS = 300
 REQUEST_DELAY = 2.0
@@ -151,25 +151,31 @@ def parse_price(value):
     except Exception:
         return None
 
-def fetch_direct(url, retries=2):
-    """جلب الصفحة من خلال ScraperAPI لتجاوز الحظر كلياً"""
+def fetch_direct(target_url, retries=2):
+    """جلب الصفحة عبر ScraperAPI مع إعدادات متوافقة وتجاوز الحظر"""
     payload = {
         'api_key': SCRAPER_API_KEY,
-        'url': url,
+        'url': target_url,
         'country_code': 'sa',
-        'render': 'false'
+        'device_type': 'desktop',
+        'keep_headers': 'true'
+    }
+    
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7'
     }
     
     for attempt in range(retries + 1):
         try:
-            logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {url}")
-            resp = session.get('http://api.scraperapi.com', params=payload, timeout=60)
+            logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {target_url}")
+            resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=60)
             
             if resp.status_code == 200 and len(resp.text) > 5000:
                 logger.info(f"Successfully fetched | Length: {len(resp.text)}")
                 return resp.text
             
-            logger.warning(f"ScraperAPI status: {resp.status_code}")
+            logger.warning(f"ScraperAPI status: {resp.status_code} | Response preview: {resp.text[:200]}")
             time.sleep(3)
         except Exception as e:
             logger.warning(f"Fetch error: {e}")
@@ -181,18 +187,19 @@ def extract_bestsellers_from_html(html):
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    # البحث عن حاويات المنتجات بجميع التنسيقات الممكنة في أمازون
+    # البحث عن عناصر المنتجات بجميع الهياكل البرمجية لأمازون
     cards = soup.select(
         "div[id^='post-'], "
         "div[class*='zg-grid-general-faceout'], "
         "div[class*='p13n-sc-unselected-item'], "
         "div.zg-carousel-general-faceout, "
         "div[data-component-type='s-search-result'], "
-        "div.p13n-sc-shoveler div[class*='a-cardui']"
+        "div.p13n-sc-shoveler div[class*='a-cardui'], "
+        "div[data-asin]"
     )
 
     if not cards:
-        cards = soup.select("div.a-section.p13n-asin, div[data-asin]")
+        cards = soup.select("div.a-section.p13n-asin")
 
     logger.info(f"HTML Cards found: {len(cards)}")
 
@@ -207,7 +214,8 @@ def extract_bestsellers_from_html(html):
                 "h2 span",
                 "div[class*='p13n-sc-css-line-clamp']",
                 ".a-size-base-plus",
-                "span.a-size-medium"
+                "span.a-size-medium",
+                "div[class*='_p13n-zg-list-grid-desktop_truncation']"
             ]:
                 tag = card.select_one(selector)
                 if tag and len(tag.get_text(strip=True)) > 3:
@@ -323,7 +331,7 @@ def run_scan():
 
     if not all_discovered:
         logger.warning("No products found across all URLs.")
-        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات. يرجى التأكد من مفتاح ScraperAPI.")
+        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات. يرجى التأكد من رصيد أو مفتاح ScraperAPI.")
         return 0
 
     unique_products = list({p["product_id"]: p for p in all_discovered}.values())
@@ -334,11 +342,11 @@ def run_scan():
 
     for deal in deals:
         msg = (
-            "🔥 <b>صيدة جديدة من الأكثر مبيعاً (Best Seller)!</b> 🔥\n\n"
+            "💥 <b>صيدة جديدة بنسبة خصم خيالية (80%+)!</b> 💥\n\n"
             f"🛍 <b>المنتج:</b> {deal['product']}\n"
             f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
             f"📈 <b>السعر السابق:</b> {deal['ref_price']} ر.س\n"
-            f"💥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
+            f"🔥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
             f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
         )
         if telegram_send(msg):
@@ -376,7 +384,7 @@ def self_ping():
 def home():
     return jsonify({
         "status": "online",
-        "bot": "Amazon SA Best Sellers Hunter",
+        "bot": "Amazon SA Best Sellers Hunter (80%+ Discounts)",
         "tracked_products": len(prices["product_id"].unique()) if not prices.empty else 0
     })
 
