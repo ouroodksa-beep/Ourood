@@ -25,7 +25,6 @@ SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890
 
 # إعدادات الفحص والتنبيه
 MIN_DISCOUNT_PERCENT = 80.0  # نسبة الخصم المطلوبة (80%)
-MIN_HISTORY = 1             # عدد مرات تسجيل السعر السابقة للتأكد من الخصم
 MAX_PRODUCTS = 300
 REQUEST_DELAY = 2.0
 SCAN_INTERVAL_MINUTES = 60
@@ -82,7 +81,6 @@ def telegram_send(message):
 # CLEAN URL BUILDER
 # ============================================================
 def get_clean_url(url):
-    """استخراج رابط المنتج المباشر بالنظام القياسي المباشر لـ ASIN"""
     asin_match = re.search(r"/(dp|gp/product)/([A-Z0-9]{10})", url)
     if asin_match:
         asin = asin_match.group(2)
@@ -186,7 +184,6 @@ def extract_bestsellers_from_html(html):
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    # محدث بالكامل لاختيار كافة أنواع الكروت في تصميم أمازون الجديد
     cards = soup.select(
         "div[id^='post-'], "
         "div[class*='zg-grid-general-faceout'], "
@@ -199,11 +196,9 @@ def extract_bestsellers_from_html(html):
         "li.zg-item-immersion"
     )
 
-    logger.info(f"HTML Cards found: {len(cards)}")
-
     for card in cards:
         try:
-            # 1. استخراج الاسم
+            # 1. الاسم
             name = None
             for selector in [
                 "div._cDE1C_truncate_3qMTh",
@@ -212,23 +207,21 @@ def extract_bestsellers_from_html(html):
                 "h2 span",
                 "div[class*='p13n-sc-css-line-clamp']",
                 ".a-size-base-plus",
-                "span.a-size-medium",
-                "div[class*='_p13n-zg-list-grid-desktop_truncationStyle_']"
+                "span.a-size-medium"
             ]:
                 tag = card.select_one(selector)
                 if tag and len(tag.get_text(strip=True)) > 3:
                     name = tag.get_text(strip=True)
                     break
 
-            # 2. استخراج السعر
+            # 2. السعر الحالي
             price = None
             for selector in [
                 "span._cDE1C_p13n-sc-price_3m33M",
                 "span.a-price span.a-offscreen",
                 "span.a-price-whole",
                 "span.p13n-sc-price",
-                "span.a-color-price",
-                "span[class*='p13n-sc-price']"
+                "span.a-color-price"
             ]:
                 tag = card.select_one(selector)
                 if tag:
@@ -236,7 +229,21 @@ def extract_bestsellers_from_html(html):
                     if price and price > 0:
                         break
 
-            # 3. استخراج الرابط والـ ASIN
+            # 3. السعر المشطوب (إن وجد في كارت المنتج)
+            old_price = None
+            for selector in [
+                "span.a-text-price span.a-offscreen",
+                "span.a-text-price",
+                "span.a-color-secondary.a-text-strike"
+            ]:
+                tag = card.select_one(selector)
+                if tag:
+                    parsed_old = parse_price(tag.get_text(strip=True))
+                    if parsed_old and parsed_old > price:
+                        old_price = parsed_old
+                        break
+
+            # 4. الرابط والـ ASIN
             raw_url = None
             link_tag = card.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/product/']")
             if not link_tag:
@@ -248,18 +255,15 @@ def extract_bestsellers_from_html(html):
 
             if name and price and price > 0 and raw_url:
                 clean_url = get_clean_url(raw_url)
-                
                 asin_match = re.search(r"/(dp|gp/product)/([A-Z0-9]{10})", raw_url)
-                if asin_match:
-                    product_id = asin_match.group(2)
-                else:
-                    product_id = card.get("data-asin") or hashlib.md5(raw_url.encode()).hexdigest()[:16]
+                product_id = asin_match.group(2) if asin_match else (card.get("data-asin") or hashlib.md5(raw_url.encode()).hexdigest()[:16])
 
                 products.append({
                     "product_id": product_id,
                     "product": str(name).strip()[:180],
                     "url": clean_url,
-                    "price": price
+                    "price": price,
+                    "old_price": old_price
                 })
         except Exception:
             continue
@@ -281,6 +285,7 @@ def process_and_check_deals(discovered_products):
         pid = item["product_id"]
         current_price = item["price"]
 
+        # 1. تسجيل السعر الحالي فوراً في قاعدة البيانات لبناء سجل التاريخ
         new_row = pd.DataFrame([{
             "product_id": pid,
             "product": item["product"],
@@ -290,26 +295,33 @@ def process_and_check_deals(discovered_products):
         }])
         prices = pd.concat([prices, new_row], ignore_index=True)
 
+        # 2. تحديد السعر المرجعي (إما متوسط السجل القديم OR السعر المشطوب في الصفحة)
         prod_history = prices[prices["product_id"] == pid].sort_values("timestamp")
-        
-        if len(prod_history) >= (MIN_HISTORY + 1):
+        ref_price = None
+
+        if len(prod_history) > 1:
+            # إذا كان فيه سجل أسعار قديمة، نحسب متوسط الأسعار السابقة
             old_prices = prod_history["price"].iloc[:-1].astype(float)
             ref_price = float(old_prices.median())
+        elif item["old_price"]:
+            # لو دي أول مرة يشوف المنتج ولكن فيه سعر قديم مشطوب على الصفحة
+            ref_price = item["old_price"]
 
-            if ref_price > current_price:
-                discount = ((ref_price - current_price) / ref_price) * 100
-                
-                if discount >= MIN_DISCOUNT_PERCENT:
-                    alert_id = f"{pid}_{current_price}_{round(discount)}"
-                    if alert_id not in sent_alerts:
-                        alerts_to_send.append({
-                            "alert_id": alert_id,
-                            "product": item["product"],
-                            "current_price": current_price,
-                            "ref_price": ref_price,
-                            "discount": round(discount, 1),
-                            "url": item["url"]
-                        })
+        # 3. حساب نسبة الخصم
+        if ref_price and ref_price > current_price:
+            discount = ((ref_price - current_price) / ref_price) * 100
+            
+            if discount >= MIN_DISCOUNT_PERCENT:
+                alert_id = f"{pid}_{current_price}_{round(discount)}"
+                if alert_id not in sent_alerts:
+                    alerts_to_send.append({
+                        "alert_id": alert_id,
+                        "product": item["product"],
+                        "current_price": current_price,
+                        "ref_price": ref_price,
+                        "discount": round(discount, 1),
+                        "url": item["url"]
+                    })
 
     return alerts_to_send
 
@@ -337,14 +349,14 @@ def run_scan():
     logger.info(f"Unique products extracted: {len(unique_products)}")
 
     deals = process_and_check_deals(unique_products)
-    save_database()
+    save_database()  # حفظ الأسعار الجديدة والتنبيهات في ملفات CSV
 
     for deal in deals:
         msg = (
             "💥 <b>صيدة جديدة بنسبة خصم خيالية (80%+)!</b> 💥\n\n"
             f"🛍 <b>المنتج:</b> {deal['product']}\n"
             f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
-            f"📈 <b>السعر السابق:</b> {deal['ref_price']} ر.س\n"
+            f"📈 <b>السعر المرجعي/السابق:</b> {deal['ref_price']} ر.س\n"
             f"🔥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
             f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
         )
@@ -395,20 +407,6 @@ def ping():
 def manual_scan():
     deals_count = run_scan()
     return jsonify({"status": "success", "deals_sent": deals_count})
-
-@app.route("/test-fetch")
-def test_fetch():
-    url = DISCOVERY_URLS[0]
-    html = fetch_direct(url)
-    if html:
-        products = extract_bestsellers_from_html(html)
-        return jsonify({
-            "success": True,
-            "html_length": len(html),
-            "products_found": len(products),
-            "sample": products[:2] if products else []
-        })
-    return jsonify({"success": False, "error": "Fetch failed"}), 500
 
 # ============================================================
 # MAIN
