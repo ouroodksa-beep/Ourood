@@ -17,14 +17,14 @@ from bs4 import BeautifulSoup
 # ============================================================
 # SETTINGS & CONFIGURATION
 # ============================================================
-BOT_TOKEN = "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA"
-CHAT_ID = "432826122"
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
+CHAT_ID = os.environ.get("CHAT_ID", "432826122")
 
 # 🔑 ScraperAPI Key
-SCRAPER_API_KEY = "f56b509d66fa5a0f2b234473858004b7"
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "f56b509d66fa5a0f2b234473858004b7")
 
 # إعدادات الفحص والتنبيه
-MIN_DISCOUNT_PERCENT = 25.0  # الحد الأدنى لنسبة الخصم المقبولة (25%)
+MIN_DISCOUNT_PERCENT = 80.0  # تم التعديل إلى 80% بناءً على طلبك
 MIN_HISTORY = 1             # عدد مرات تسجيل السعر السابقة للتأكد من الخصم
 MAX_PRODUCTS = 300
 REQUEST_DELAY = 2.0
@@ -125,7 +125,7 @@ def save_database():
 load_database()
 
 # ============================================================
-# FETCH VIA SCRAPERAPI & PARSE
+# FETCH VIA SCRAPERAPI & PARSE (FIXED & IMPROVED)
 # ============================================================
 def parse_price(value):
     if value is None:
@@ -151,25 +151,22 @@ def parse_price(value):
     except Exception:
         return None
 
-def fetch_direct(url, retries=2):
-    """جلب الصفحة من خلال ScraperAPI لتجاوز الحظر كلياً"""
-    payload = {
-        'api_key': SCRAPER_API_KEY,
-        'url': url,
-        'country_code': 'sa',
-        'render': 'false'
-    }
+def fetch_direct(target_url, retries=2):
+    """جلب الصفحة من خلال ScraperAPI مع الترميز الصحيح للروابط"""
+    # تشفير الرابط لضمان عدم حدوث أخطاء مع ScraperAPI
+    encoded_url = quote(target_url, safe='')
+    scraper_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={encoded_url}&country_code=sa&device_type=desktop"
     
     for attempt in range(retries + 1):
         try:
-            logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {url}")
-            resp = session.get('http://api.scraperapi.com', params=payload, timeout=60)
+            logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {target_url}")
+            resp = session.get(scraper_url, timeout=60)
             
             if resp.status_code == 200 and len(resp.text) > 5000:
                 logger.info(f"Successfully fetched | Length: {len(resp.text)}")
                 return resp.text
             
-            logger.warning(f"ScraperAPI status: {resp.status_code}")
+            logger.warning(f"ScraperAPI status: {resp.status_code} | Response preview: {resp.text[:200]}")
             time.sleep(3)
         except Exception as e:
             logger.warning(f"Fetch error: {e}")
@@ -323,7 +320,7 @@ def run_scan():
 
     if not all_discovered:
         logger.warning("No products found across all URLs.")
-        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات. يرجى التأكد من مفتاح ScraperAPI.")
+        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات. يرجى التأكد من رصيد أو مفتاح ScraperAPI.")
         return 0
 
     unique_products = list({p["product_id"]: p for p in all_discovered}.values())
@@ -334,11 +331,11 @@ def run_scan():
 
     for deal in deals:
         msg = (
-            "🔥 <b>صيدة جديدة من الأكثر مبيعاً (Best Seller)!</b> 🔥\n\n"
+            "💥 <b>صيدة جديدة بنسبة خصم خيالية (80%+)!</b> 💥\n\n"
             f"🛍 <b>المنتج:</b> {deal['product']}\n"
             f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
             f"📈 <b>السعر السابق:</b> {deal['ref_price']} ر.س\n"
-            f"💥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
+            f"🔥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
             f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
         )
         if telegram_send(msg):
@@ -376,7 +373,7 @@ def self_ping():
 def home():
     return jsonify({
         "status": "online",
-        "bot": "Amazon SA Best Sellers Hunter",
+        "bot": "Amazon SA Best Sellers Hunter (80%+ Discounts)",
         "tracked_products": len(prices["product_id"].unique()) if not prices.empty else 0
     })
 
