@@ -32,6 +32,10 @@ PRICE_FILE = "amazon_sa_prices.csv"
 ALERT_FILE = "amazon_sa_alerts.csv"
 SELF_PING_INTERVAL = 600
 
+# متغير لمتابعة الفحص المباشر وإلغاء أي فحص سابق لو انطلب فحص جديد
+current_scan_id = 0
+scan_lock = threading.Lock()
+
 # ============================================================
 # AMAZON SA BESTSELLERS URLS
 # ============================================================
@@ -166,17 +170,18 @@ def fetch_direct(target_url, retries=2):
     for attempt in range(retries + 1):
         try:
             logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {target_url}")
-            resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=60)
+            # رفع مهلة الانتظار لـ 90 ثانية لمنع خطأ Timeout
+            resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=90)
             
             if resp.status_code == 200 and len(resp.text) > 5000:
                 logger.info(f"Successfully fetched | Length: {len(resp.text)}")
                 return resp.text
             
             logger.warning(f"ScraperAPI status: {resp.status_code}")
-            time.sleep(3)
+            time.sleep(2)
         except Exception as e:
             logger.warning(f"Fetch error: {e}")
-            time.sleep(3)
+            time.sleep(2)
             
     return None
 
@@ -229,7 +234,7 @@ def extract_bestsellers_from_html(html):
                     if price and price > 0:
                         break
 
-            # 3. السعر المشطوب (إن وجد في كارت المنتج)
+            # 3. السعر المشطوب (إن وجد)
             old_price = None
             for selector in [
                 "span.a-text-price span.a-offscreen",
@@ -285,7 +290,7 @@ def process_and_check_deals(discovered_products):
         pid = item["product_id"]
         current_price = item["price"]
 
-        # 1. تسجيل السعر الحالي فوراً في قاعدة البيانات لبناء سجل التاريخ
+        # تسجيل السعر لبناء السجل والتاريخ
         new_row = pd.DataFrame([{
             "product_id": pid,
             "product": item["product"],
@@ -295,19 +300,15 @@ def process_and_check_deals(discovered_products):
         }])
         prices = pd.concat([prices, new_row], ignore_index=True)
 
-        # 2. تحديد السعر المرجعي (إما متوسط السجل القديم OR السعر المشطوب في الصفحة)
         prod_history = prices[prices["product_id"] == pid].sort_values("timestamp")
         ref_price = None
 
         if len(prod_history) > 1:
-            # إذا كان فيه سجل أسعار قديمة، نحسب متوسط الأسعار السابقة
             old_prices = prod_history["price"].iloc[:-1].astype(float)
             ref_price = float(old_prices.median())
         elif item["old_price"]:
-            # لو دي أول مرة يشوف المنتج ولكن فيه سعر قديم مشطوب على الصفحة
             ref_price = item["old_price"]
 
-        # 3. حساب نسبة الخصم
         if ref_price and ref_price > current_price:
             discount = ((ref_price - current_price) / ref_price) * 100
             
@@ -326,13 +327,24 @@ def process_and_check_deals(discovered_products):
     return alerts_to_send
 
 def run_scan():
+    global current_scan_id
+    
+    with scan_lock:
+        current_scan_id += 1
+        my_scan_id = current_scan_id
+
     logger.info("=" * 60)
-    logger.info("STARTING AMAZON SA BESTSELLERS SCAN")
+    logger.info(f"STARTING AMAZON SA SCAN (Scan ID: {my_scan_id})")
     logger.info("=" * 60)
 
     all_discovered = []
 
     for url in DISCOVERY_URLS:
+        # إلغاء الفحص لو انطلب فحص جديد بإرسال /scan
+        if my_scan_id != current_scan_id:
+            logger.info(f"Scan ID {my_scan_id} cancelled in favor of new Scan ID {current_scan_id}")
+            return 0
+
         html = fetch_direct(url)
         if html:
             items = extract_bestsellers_from_html(html)
@@ -340,23 +352,29 @@ def run_scan():
             logger.info(f"Extracted {len(items)} items from: {url}")
         time.sleep(REQUEST_DELAY)
 
+    if my_scan_id != current_scan_id:
+        return 0
+
     if not all_discovered:
         logger.warning("No products found across all URLs.")
-        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات. يرجى التأكد من رصيد ScraperAPI.")
+        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات في هذا الفحص.")
         return 0
 
     unique_products = list({p["product_id"]: p for p in all_discovered}.values())
     logger.info(f"Unique products extracted: {len(unique_products)}")
 
     deals = process_and_check_deals(unique_products)
-    save_database()  # حفظ الأسعار الجديدة والتنبيهات في ملفات CSV
+    save_database()
 
     for deal in deals:
+        if my_scan_id != current_scan_id:
+            return 0
+
         msg = (
             "💥 <b>صيدة جديدة بنسبة خصم خيالية (80%+)!</b> 💥\n\n"
             f"🛍 <b>المنتج:</b> {deal['product']}\n"
             f"💰 <b>السعر الحالي:</b> {deal['current_price']} ر.س\n"
-            f"📈 <b>السعر المرجعي/السابق:</b> {deal['ref_price']} ر.س\n"
+            f"📈 <b>السعر المرجعي:</b> {deal['ref_price']} ر.س\n"
             f"🔥 <b>نسبة الخصم:</b> {deal['discount']}%\n\n"
             f"🔗 <b>رابط الشراء:</b>\n{deal['url']}"
         )
@@ -365,8 +383,35 @@ def run_scan():
             save_database()
             time.sleep(1)
 
-    logger.info(f"Scan finished. New deals sent: {len(deals)}")
+    logger.info(f"Scan {my_scan_id} finished. New deals sent: {len(deals)}")
     return len(deals)
+
+# ============================================================
+# TELEGRAM COMMAND LISTENER (/scan)
+# ============================================================
+def telegram_listener():
+    """الاستماع لرستئل تليجرام وبدء الفحص فور استلام الأمر /scan"""
+    last_update_id = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 30}
+            resp = session.get(url, params=params, timeout=35)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("ok"):
+                    for update in data.get("result", []):
+                        last_update_id = update["update_id"]
+                        message = update.get("message", {})
+                        text = message.get("text", "").strip()
+
+                        if text == "/scan" or text.startswith("/scan@"):
+                            telegram_send("⚡️ <b>تم استلام الأمر! جاري إيقاف الفحص الحالي وبدء فحص جديد فوراً...</b>")
+                            threading.Thread(target=run_scan, daemon=True).start()
+        except Exception as e:
+            logger.error(f"Telegram listener error: {e}")
+        time.sleep(3)
 
 # ============================================================
 # BACKGROUND SCHEDULER & KEEP-ALIVE
@@ -405,14 +450,21 @@ def ping():
 
 @app.route("/scan")
 def manual_scan():
-    deals_count = run_scan()
-    return jsonify({"status": "success", "deals_sent": deals_count})
+    threading.Thread(target=run_scan, daemon=True).start()
+    return jsonify({"status": "success", "message": "New scan started"})
 
 # ============================================================
 # MAIN
 # ============================================================
 if __name__ == "__main__":
+    # رسالة تأكيدية عند التشغيل
+    telegram_send("🚀 <b>تم تشغيل السكربت بنجاح! يمكنك إرسال /scan بأي وقت لبدء الفحص فوراً.</b>")
+    
+    # تشغيل الفحص الأولي ومستمع أوامر تليجرام
+    threading.Thread(target=run_scan, daemon=True).start()
+    threading.Thread(target=telegram_listener, daemon=True).start()
     threading.Thread(target=background_scanner, daemon=True).start()
     threading.Thread(target=self_ping, daemon=True).start()
+    
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
