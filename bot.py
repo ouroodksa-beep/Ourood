@@ -20,14 +20,14 @@ from bs4 import BeautifulSoup
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
 CHAT_ID = os.environ.get("CHAT_ID", "432826122")
 
-# 🔑 ScraperAPI Key الجديد
+# 🔑 ScraperAPI Key
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 
 # إعدادات الفحص والتنبيه
 MIN_DISCOUNT_PERCENT = 80.0  # نسبة الخصم المطلوبة (80%)
 MIN_HISTORY = 1             # عدد مرات تسجيل السعر السابقة للتأكد من الخصم
 MAX_PRODUCTS = 300
-REQUEST_DELAY = 2.0
+REQUEST_DELAY = 3.0
 SCAN_INTERVAL_MINUTES = 60
 PRICE_FILE = "amazon_sa_prices.csv"
 ALERT_FILE = "amazon_sa_alerts.csv"
@@ -125,7 +125,7 @@ def save_database():
 load_database()
 
 # ============================================================
-# FETCH VIA SCRAPERAPI & PARSE
+# FETCH VIA SCRAPERAPI & PARSE (FIXED SCRAPERAPI CALL)
 # ============================================================
 def parse_price(value):
     if value is None:
@@ -152,34 +152,29 @@ def parse_price(value):
         return None
 
 def fetch_direct(target_url, retries=2):
-    """جلب الصفحة عبر ScraperAPI مع إعدادات متوافقة وتجاوز الحظر"""
+    """جلب الصفحة عبر ScraperAPI مع تفعيل JS Rendering لمنع الكابتشا وتجاوز حظر أمازون"""
     payload = {
         'api_key': SCRAPER_API_KEY,
         'url': target_url,
         'country_code': 'sa',
         'device_type': 'desktop',
-        'keep_headers': 'true'
-    }
-    
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7'
+        'render': 'true'  # تفعيل تشغيل الجافاسكربت لتخطي صفحة الكابتشا
     }
     
     for attempt in range(retries + 1):
         try:
             logger.info(f"Fetching via ScraperAPI (Attempt {attempt + 1}): {target_url}")
-            resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=60)
+            resp = session.get('http://api.scraperapi.com', params=payload, timeout=90)
             
             if resp.status_code == 200 and len(resp.text) > 5000:
                 logger.info(f"Successfully fetched | Length: {len(resp.text)}")
                 return resp.text
             
-            logger.warning(f"ScraperAPI status: {resp.status_code} | Response preview: {resp.text[:200]}")
-            time.sleep(3)
+            logger.warning(f"ScraperAPI Status Code: {resp.status_code}")
+            time.sleep(4)
         except Exception as e:
             logger.warning(f"Fetch error: {e}")
-            time.sleep(3)
+            time.sleep(4)
             
     return None
 
@@ -187,7 +182,7 @@ def extract_bestsellers_from_html(html):
     soup = BeautifulSoup(html, "lxml")
     products = []
 
-    # البحث عن عناصر المنتجات بجميع الهياكل البرمجية لأمازون
+    # التحديد المرن لعناصر أمازون السعودية بأحدث الهياكل
     cards = soup.select(
         "div[id^='post-'], "
         "div[class*='zg-grid-general-faceout'], "
@@ -195,7 +190,8 @@ def extract_bestsellers_from_html(html):
         "div.zg-carousel-general-faceout, "
         "div[data-component-type='s-search-result'], "
         "div.p13n-sc-shoveler div[class*='a-cardui'], "
-        "div[data-asin]"
+        "div[data-asin], "
+        "li.zg-item-immersion"
     )
 
     if not cards:
@@ -215,7 +211,7 @@ def extract_bestsellers_from_html(html):
                 "div[class*='p13n-sc-css-line-clamp']",
                 ".a-size-base-plus",
                 "span.a-size-medium",
-                "div[class*='_p13n-zg-list-grid-desktop_truncation']"
+                "div._p13n-zg-list-grid-desktop_truncationStyle_p13n-sc-css-line-clamp__1p21s"
             ]:
                 tag = card.select_one(selector)
                 if tag and len(tag.get_text(strip=True)) > 3:
@@ -331,7 +327,7 @@ def run_scan():
 
     if not all_discovered:
         logger.warning("No products found across all URLs.")
-        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات. يرجى التأكد من رصيد أو مفتاح ScraperAPI.")
+        telegram_send("⚠️ <b>تنبيه البوت:</b> لم يتم العثور على منتجات. يرجى التأكد من رصيد ScraperAPI.")
         return 0
 
     unique_products = list({p["product_id"]: p for p in all_discovered}.values())
