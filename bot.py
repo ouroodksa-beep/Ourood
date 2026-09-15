@@ -11,18 +11,18 @@ import requests
 from flask import Flask, jsonify
 from bs4 import BeautifulSoup
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
-CHAT_ID = os.environ.get("CHAT_ID", "432826122")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "ضع_توكن_البوت_هنا")
+CHAT_ID = os.environ.get("CHAT_ID", "ضع_آيدي_القناة_أو_الشات_هنا")
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "ضع_مفتاح_SCRAPER_API_هنا")
 
-MIN_DISCOUNT_PERCENT = 70.0  
-CHUNK_SIZE = 15  # 🎯 نطاق البحث في المرة الواحدة (15 صفحة)
+MIN_DISCOUNT_PERCENT = 70.0  # 🎯 نسبة الخصم المطلوبة
+TARGET_DEALS_COUNT = 30      # 🎯 عدد الصيدات المطلوب جمعها
+CHUNK_SIZE = 15              # 🎯 فحص 15 صفحة في كل جولة
 
 is_scanning = False
 scan_lock = threading.Lock()
 sent_alerts = set()
 
-# بداية ونهاية نطاق البحث الحالي لأمازون
 amazon_start_page = 1
 amazon_end_page = 15
 
@@ -36,7 +36,7 @@ BASE_AMAZON_URLS = [
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("amazon_chunked")
+logger = logging.getLogger("amazon_target30")
 app = Flask(__name__)
 session = requests.Session()
 
@@ -78,7 +78,7 @@ def fetch_fast(target_url):
     payload = {'api_key': SCRAPER_API_KEY, 'url': target_url, 'country_code': 'sa', 'device_type': 'desktop'}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'}
     try:
-        resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=12)
+        resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=15)
         if resp.status_code == 200:
             return resp.text
     except Exception:
@@ -106,7 +106,7 @@ def parse_and_send_amazon_deals(html):
             link_tag = card.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal")
 
             if name_tag and price_tag and old_price_tag and link_tag:
-                name = name_tag.get_text(strip=True)[:120]
+                name = name_tag.get_text(strip=True)[:100]
                 price = parse_price(price_tag.get_text(strip=True))
                 old_price = parse_price(old_price_tag.get_text(strip=True))
                 raw_url = link_tag.get("href", "")
@@ -137,37 +137,47 @@ def parse_and_send_amazon_deals(html):
             continue
     return found_in_page
 
-def run_fast_scan():
+def run_until_target_found():
     global is_scanning, amazon_start_page, amazon_end_page
     if is_scanning: return
 
     with scan_lock: is_scanning = True
-    telegram_send(f"⚡️ <b>بدأ فحص أمازون للشريحة من صفحة [{amazon_start_page}] إلى [{amazon_end_page}].. جاري البحث!</b>")
+    telegram_send(f"💥 <b>بدأ البحث المستمر في أمازون عن (30 صيدة) بخصم 70% فأكثر...</b>")
 
-    # 🚀 إنتاج 15 صفحة لكل قسم بأمازون
-    target_urls = []
-    for p in range(amazon_start_page, amazon_end_page + 1):
-        for u in BASE_AMAZON_URLS:
-            delimiter = "&" if "?" in u else "?"
-            target_urls.append(f"{u}{delimiter}pg={p}")
+    total_deals_found = 0
+    rounds_count = 0
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        html_results = list(executor.map(fetch_fast, target_urls))
+    while total_deals_found < TARGET_DEALS_COUNT:
+        rounds_count += 1
+        telegram_send(f"🔍 <b>جولة أمازون {rounds_count}:</b> فحص الصفحات من [{amazon_start_page}] إلى [{amazon_end_page}]...")
 
-    total_sent = 0
-    for html in html_results:
-        total_sent += parse_and_send_amazon_deals(html)
+        target_urls = []
+        for p in range(amazon_start_page, amazon_end_page + 1):
+            for u in BASE_AMAZON_URLS:
+                delimiter = "&" if "?" in u else "?"
+                target_urls.append(f"{u}{delimiter}pg={p}")
 
-    telegram_send(f"✅ <b>انتهى فحص أمازون للصفحات من [{amazon_start_page}] إلى [{amazon_end_page}]!</b>\nتم إرسال <b>{total_sent}</b> صيدة.\n💡 الفحص القادم سيبدأ من الصفحة [{amazon_end_page + 1}] إلى [{amazon_end_page + CHUNK_SIZE}].")
-    
-    # 🔄 تحديث الصفحة للدفعة القادمة (16-30، ثم 31-45، وهكذا لغاية 60)
-    amazon_start_page = amazon_end_page + 1
-    amazon_end_page = amazon_start_page + CHUNK_SIZE - 1
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            html_results = list(executor.map(fetch_fast, target_urls))
 
-    if amazon_start_page > 60:
-        amazon_start_page = 1
-        amazon_end_page = 15
+        round_found = 0
+        for html in html_results:
+            round_found += parse_and_send_amazon_deals(html)
 
+        total_deals_found += round_found
+        telegram_send(f"📊 <b>نتيجة جولة أمازون {rounds_count}:</b> تم إيجاد {round_found} صيدة. (الإجمالي الحالي: {total_deals_found}/{TARGET_DEALS_COUNT})")
+
+        amazon_start_page = amazon_end_page + 1
+        amazon_end_page = amazon_start_page + CHUNK_SIZE - 1
+
+        if amazon_start_page > 120:
+            amazon_start_page = 1
+            amazon_end_page = 15
+
+        if total_deals_found < TARGET_DEALS_COUNT:
+            time.sleep(2)
+
+    telegram_send(f"🎉 <b>تم اكتمال هدف أمازون!</b>\nتم إرسال 30 صيدة بخصم 70% فأكثر.")
     is_scanning = False
 
 def telegram_listener():
@@ -183,18 +193,18 @@ def telegram_listener():
 
                     if text in ["/scan", "/scan@"]:
                         if is_scanning:
-                            telegram_send("⏳ <b>جاري الفحص حالياً.. يرجى الانتظار.</b>")
+                            telegram_send("⏳ <b>جاري البحث عن الـ 30 صيدة في أمازون حالياً..</b>")
                         else:
-                            threading.Thread(target=run_fast_scan, daemon=True).start()
+                            threading.Thread(target=run_until_target_found, daemon=True).start()
         except Exception:
             pass
         time.sleep(2)
 
 @app.route("/")
 def home():
-    return jsonify({"status": "amazon_15chunk_online", "next_start_page": amazon_start_page, "next_end_page": amazon_end_page})
+    return jsonify({"status": "amazon_30target_active", "current_start": amazon_start_page, "current_end": amazon_end_page})
 
 if __name__ == "__main__":
-    telegram_send("🚀 <b>تم تشغيل بوت أمازون (نظام الـ 15 صفحة)! أرسلي /scan للبدء.</b>")
+    telegram_send("🚀 <b>تم تشغيل بوت أمازون! أرسلي /scan للبدء بالبحث حتى الوصول إلى 30 صيدة بخصم 70%.</b>")
     threading.Thread(target=telegram_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
