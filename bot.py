@@ -17,27 +17,26 @@ SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890
 
 MIN_DISCOUNT_PERCENT = 70.0  
 TARGET_DEALS_COUNT = 30
-CHUNK_SIZE = 15  
+CHUNK_SIZE = 5  # تقليل حجم الشريحة لمنع Timeout
 
 is_scanning = False
 scan_lock = threading.Lock()
 sent_alerts = set()
 
-# بداية ونهاية نطاق البحث الحالي لأمازون
 amazon_start_page = 1
-amazon_end_page = 15
+amazon_end_page = 5
 
+# روابط أمازون السعودية المفلترة مباشرة للخصومات من 70% وأكثر
 BASE_AMAZON_URLS = [
-    "https://www.amazon.sa/gp/goldbox",
-    "https://www.amazon.sa/gp/bestsellers/electronics",
-    "https://www.amazon.sa/gp/bestsellers/mobile-phones",
-    "https://www.amazon.sa/gp/bestsellers/kitchen",
-    "https://www.amazon.sa/gp/bestsellers/beauty",
-    "https://www.amazon.sa/gp/bestsellers/fashion"
+    "https://www.amazon.sa/s?i=electronics&rh=p_85%3A20858807031%2Cp_8%3A70-&fs=true",
+    "https://www.amazon.sa/s?i=mobile-phones&rh=p_8%3A70-&fs=true",
+    "https://www.amazon.sa/s?i=kitchen&rh=p_8%3A70-&fs=true",
+    "https://www.amazon.sa/s?i=beauty&rh=p_8%3A70-&fs=true",
+    "https://www.amazon.sa/s?i=fashion&rh=p_8%3A70-&fs=true"
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("amazon_render_target")
+logger = logging.getLogger("amazon_direct_fix")
 app = Flask(__name__)
 session = requests.Session()
 
@@ -75,19 +74,21 @@ def parse_price(value):
     except Exception:
         return None
 
-def fetch_fast_render(target_url):
-    # 🎯 تفعيل render=true لجلب صفحات أمازون الديناميكية بالكامل مثل كود نون
+def fetch_page(target_url):
+    # الطلب بوضع الكشط المباشر السريع بدون إجهاد الـ Render
     payload = {
         'api_key': SCRAPER_API_KEY, 
         'url': target_url, 
         'country_code': 'sa', 
-        'device_type': 'desktop',
-        'render': 'true'
+        'keep_headers': 'true'
     }
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
     try:
-        resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=30)
-        if resp.status_code == 200 and len(resp.text) > 10000:
+        resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=20)
+        if resp.status_code == 200 and len(resp.text) > 5000:
             return resp.text
     except Exception as e:
         logger.error(f"Amazon Fetch Error: {e}")
@@ -97,28 +98,21 @@ def parse_and_send_amazon_deals(html):
     if not html: return 0
     soup = BeautifulSoup(html, "lxml")
     
-    cards = soup.select(
-        "div[id^='post-'], "
-        "div[class*='zg-grid-general-faceout'], "
-        "div[class*='p13n-sc-unselected-item'], "
-        "div[data-component-type='s-search-result'], "
-        "div.p13n-grid-content, "
-        "div.grid-item, "
-        "div[data-asin]:not([data-asin=''])"
-    )
+    # استهداف كروت نتائج البحث المباشرة
+    cards = soup.select("div[data-component-type='s-search-result']")
 
     found_in_page = 0
     for card in cards:
         try:
-            name_tag = card.select_one("div._cDE1C_truncate_3qMTh, span.zg-text-js-truncate, a.a-link-normal span, h2 span, span.a-size-base-plus, span.a-size-medium")
-            price_tag = card.select_one("span._cDE1C_p13n-sc-price_3m33M, span.a-price span.a-offscreen, span.p13n-sc-price")
-            old_price_tag = card.select_one("span.a-text-price span.a-offscreen, span.a-color-secondary.a-text-strike")
-            link_tag = card.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/product/'], a.a-link-normal")
+            name_tag = card.select_one("h2 a span, span.a-size-base-plus, span.a-size-medium")
+            price_tag = card.select_one("span.a-price span.a-offscreen")
+            old_price_tag = card.select_one("span.a-text-price span.a-offscreen")
+            link_tag = card.select_one("h2 a.a-link-normal, a.a-link-normal[href*='/dp/']")
 
-            if name_tag and price_tag and old_price_tag and link_tag:
+            if name_tag and price_tag and link_tag:
                 name = name_tag.get_text(strip=True)[:120]
                 price = parse_price(price_tag.get_text(strip=True))
-                old_price = parse_price(old_price_tag.get_text(strip=True))
+                old_price = parse_price(old_price_tag.get_text(strip=True)) if old_price_tag else None
                 raw_url = link_tag.get("href", "")
 
                 if price and old_price and old_price > price:
@@ -126,10 +120,9 @@ def parse_and_send_amazon_deals(html):
 
                     if discount >= MIN_DISCOUNT_PERCENT:
                         clean_url = "https://www.amazon.sa" + raw_url if raw_url.startswith("/") else raw_url.split("?")[0]
-                        asin_match = re.search(r"/(dp|gp/product)/([A-Z0-9]{10})", clean_url)
-                        pid = asin_match.group(2) if asin_match else hashlib.md5(clean_url.encode()).hexdigest()[:10]
+                        asin = card.get("data-asin", "") or hashlib.md5(clean_url.encode()).hexdigest()[:10]
 
-                        alert_key = f"{pid}_{price}"
+                        alert_key = f"{asin}_{price}"
                         if alert_key not in sent_alerts:
                             sent_alerts.add(alert_key)
                             found_in_page += 1
@@ -152,24 +145,23 @@ def run_until_target_found():
     if is_scanning: return
 
     with scan_lock: is_scanning = True
-    telegram_send(f"🚀 <b>بدأ فحص أمازون الحقيقي (مع تفعيل JS Rendering)...</b>\nجاري البحث عن 30 صيدة بخصم 70%.")
+    telegram_send("🚀 <b>بدأ فحص أمازون المباشر (روابط الخصومات المفلترة)...</b>")
 
     total_deals_found = 0
     rounds_count = 0
 
     while total_deals_found < TARGET_DEALS_COUNT:
         rounds_count += 1
-        telegram_send(f"🔍 <b>جولة أمازون {rounds_count}:</b> جاري كشط الصفحات من [{amazon_start_page}] إلى [{amazon_end_page}]...")
+        telegram_send(f"🔍 <b>جولة أمازون {rounds_count}:</b> كشط الصفحات من [{amazon_start_page}] إلى [{amazon_end_page}]...")
 
         target_urls = []
         for p in range(amazon_start_page, amazon_end_page + 1):
             for u in BASE_AMAZON_URLS:
-                delimiter = "&" if "?" in u else "?"
-                target_urls.append(f"{u}{delimiter}pg={p}")
+                target_urls.append(f"{u}&page={p}")
 
-        # تقليل Threads إلى 3 لضمان استقرار ScraperAPI مع الـ Render
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            html_results = list(executor.map(fetch_fast_render, target_urls))
+        # تنفيذ الطلبات على مرحلتين متتاليتين لتجنب الضغط على ScraperAPI
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            html_results = list(executor.map(fetch_page, target_urls))
 
         round_found = 0
         valid_pages_count = 0
@@ -184,12 +176,12 @@ def run_until_target_found():
         amazon_start_page = amazon_end_page + 1
         amazon_end_page = amazon_start_page + CHUNK_SIZE - 1
 
-        if amazon_start_page > 60:
+        if amazon_start_page > 30:
             amazon_start_page = 1
-            amazon_end_page = 15
+            amazon_end_page = 5
 
         if total_deals_found < TARGET_DEALS_COUNT:
-            time.sleep(3)
+            time.sleep(2)
 
     telegram_send(f"🎉 <b>تم الوصول للهدف!</b> تم إرسال {total_deals_found} صيدة من أمازون.")
     is_scanning = False
@@ -216,9 +208,9 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "amazon_render_active", "start": amazon_start_page, "end": amazon_end_page})
+    return jsonify({"status": "amazon_direct_active", "start": amazon_start_page, "end": amazon_end_page})
 
 if __name__ == "__main__":
-    telegram_send("🚀 <b>تم تحديث بوت أمازون لنظام الـ Rendering وجمع الـ 30 صيدة! أرسلي /scan للتجربة.</b>")
+    telegram_send("🚀 <b>تم تشغيل البوت بنظام روابط الخصم المباشرة! أرسلي /scan للبدء.</b>")
     threading.Thread(target=telegram_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
