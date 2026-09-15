@@ -23,21 +23,22 @@ is_scanning = False
 scan_lock = threading.Lock()
 sent_alerts = set()
 
-# روابط أقسام التخفيضات والأكثر مبيعاً في أمازون السعودية
-AMAZON_URLS = [
+# 🎯 عداد حفظ الصفحة الحالية لأمازون (يبدأ من 1 ويكمل تلقائياً)
+amazon_current_page = 1
+
+BASE_AMAZON_URLS = [
     "https://www.amazon.sa/gp/goldbox",
     "https://www.amazon.sa/gp/bestsellers/electronics",
     "https://www.amazon.sa/gp/bestsellers/mobile-phones",
-    "https://www.amazon.sa/gp/bestsellers/computers",
     "https://www.amazon.sa/gp/bestsellers/kitchen",
     "https://www.amazon.sa/gp/bestsellers/beauty",
-    "https://www.amazon.sa/gp/bestsellers/supermarket",
     "https://www.amazon.sa/gp/bestsellers/fashion",
+    "https://www.amazon.sa/gp/bestsellers/supermarket",
     "https://www.amazon.sa/gp/bestsellers/toys"
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("fast_amazon")
+logger = logging.getLogger("amazon_paged")
 app = Flask(__name__)
 session = requests.Session()
 
@@ -75,14 +76,8 @@ def parse_price(value):
     except Exception:
         return None
 
-# 🚀 جلب مباشر وسريع جداً لصفحات أمازون
 def fetch_fast(target_url):
-    payload = {
-        'api_key': SCRAPER_API_KEY,
-        'url': target_url,
-        'country_code': 'sa',
-        'device_type': 'desktop'
-    }
+    payload = {'api_key': SCRAPER_API_KEY, 'url': target_url, 'country_code': 'sa', 'device_type': 'desktop'}
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'}
     try:
         resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=12)
@@ -138,44 +133,63 @@ def parse_and_send_amazon_deals(html):
                                 f"📈 <b>السعر الأصلي:</b> {old_price} ر.س\n\n"
                                 f"🔗 <b>رابط الشراء المباشر:</b>\n{clean_url}"
                             )
-                            # ⚡️ إرسال فوري للتليجرام
                             telegram_send(msg)
                             time.sleep(0.5)
         except Exception:
             continue
     return found_in_page
 
-# ⚡️ فحص سريع بالتوازي لجميع أقسام أمازون
 def run_fast_scan():
-    global is_scanning
+    global is_scanning, amazon_current_page
     if is_scanning: return
 
     with scan_lock: is_scanning = True
-    telegram_send("⚡️ <b>بدأ الفحص السريع لأمازون السعودية.. ستصلك الصيدات فور اكتشافها!</b>")
+    telegram_send(f"⚡️ <b>بدأ فحص أمازون لصفحة رقم [{amazon_current_page}].. جاري البحث!</b>")
 
-    # جلب جميع الصفحات معاً في أجزاء من الثانية
+    # 🔗 إضافة بارامتر رقم الصفحة pg لكل قسم
+    target_urls = []
+    for u in BASE_AMAZON_URLS:
+        delimiter = "&" if "?" in u else "?"
+        target_urls.append(f"{u}{delimiter}pg={amazon_current_page}")
+
     with ThreadPoolExecutor(max_workers=5) as executor:
-        html_results = list(executor.map(fetch_fast, AMAZON_URLS))
+        html_results = list(executor.map(fetch_fast, target_urls))
 
     total_sent = 0
     for html in html_results:
         total_sent += parse_and_send_amazon_deals(html)
 
-    telegram_send(f"✅ <b>انتهى فحص أمازون!</b> تم إرسال <b>{total_sent}</b> صيدة بخصم 70%+ بنجاح.")
+    telegram_send(f"✅ <b>انتهى فحص أمازون لصفحة [{amazon_current_page}]!</b> تم إرسال <b>{total_sent}</b> صيدة.\n💡 الفحص القادم سيبدأ تلقائياً من الصفحة [{amazon_current_page + 1}].")
+    
+    # 🔄 الانتقال للصفحة التالية (حتى الصفحة 10 ثم العودة للصفحة الأولى)
+    amazon_current_page = amazon_current_page + 1 if amazon_current_page < 10 else 1
     is_scanning = False
+
+def telegram_listener():
+    last_update_id = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+            resp = session.get(url, params={"offset": last_update_id + 1, "timeout": 20}, timeout=25)
+            if resp.status_code == 200 and resp.json().get("ok"):
+                for update in resp.json().get("result", []):
+                    last_update_id = update["update_id"]
+                    text = update.get("message", {}).get("text", "").strip()
+
+                    if text in ["/scan", "/scan@"]:
+                        if is_scanning:
+                            telegram_send("⏳ <b>جاري الفحص حالياً.. يرجى الانتظار.</b>")
+                        else:
+                            threading.Thread(target=run_fast_scan, daemon=True).start()
+        except Exception:
+            pass
+        time.sleep(2)
 
 @app.route("/")
 def home():
-    return jsonify({"status": "amazon_fast_online"})
-
-@app.route("/scan")
-def manual_scan():
-    if not is_scanning:
-        threading.Thread(target=run_fast_scan, daemon=True).start()
-        return jsonify({"status": "started"})
-    return jsonify({"status": "busy"})
+    return jsonify({"status": "amazon_paged_online", "current_page": amazon_current_page})
 
 if __name__ == "__main__":
-    telegram_send("🚀 <b>تم تشغيل بوت أمازون السريع! أرسلي /scan للبدء.</b>")
-    threading.Thread(target=run_fast_scan, daemon=True).start()
+    telegram_send("🚀 <b>تم تشغيل بوت أمازون المطور! أرسلي /scan للبدء وسيكمل الصفحات بالتتابع.</b>")
+    threading.Thread(target=telegram_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
