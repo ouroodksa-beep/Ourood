@@ -11,31 +11,32 @@ import requests
 from flask import Flask, jsonify
 from bs4 import BeautifulSoup
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8603881184:AAH_x-NK8zDqRnt2kRlp2Ti6GbBFAiDzuuo")
 CHAT_ID = os.environ.get("CHAT_ID", "432826122")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 
 MIN_DISCOUNT_PERCENT = 70.0  
-MAX_PAGES_TO_SCAN = 10  # 🎯 تم ضبط نطاق البحث ليشمل 10 صفحات كاملة
+CHUNK_SIZE = 15  # 🎯 نطاق البحث في المرة الواحدة (15 صفحة)
 
 is_scanning = False
 scan_lock = threading.Lock()
 sent_alerts = set()
-amazon_current_page = 1
 
-BASE_AMAZON_URLS = [
-    "https://www.amazon.sa/gp/goldbox",
-    "https://www.amazon.sa/gp/bestsellers/electronics",
-    "https://www.amazon.sa/gp/bestsellers/mobile-phones",
-    "https://www.amazon.sa/gp/bestsellers/kitchen",
-    "https://www.amazon.sa/gp/bestsellers/beauty",
-    "https://www.amazon.sa/gp/bestsellers/fashion",
-    "https://www.amazon.sa/gp/bestsellers/supermarket",
-    "https://www.amazon.sa/gp/bestsellers/toys"
+# بداية ونهاية نطاق البحث الحالي
+start_page = 1
+end_page = 15
+
+BASE_NOON_URLS = [
+    "https://minutes.noon.com/saudi-ar/",
+    "https://www.noon.com/saudi-ar/bestsellers/",
+    "https://www.noon.com/saudi-ar/mega-deals/",
+    "https://www.noon.com/saudi-ar/electronics-and-mobile/bestseller",
+    "https://www.noon.com/saudi-ar/home-and-kitchen/bestseller",
+    "https://www.noon.com/saudi-ar/beauty-and-health/bestseller"
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("amazon_10pages")
+logger = logging.getLogger("noon_chunked")
 app = Flask(__name__)
 session = requests.Session()
 
@@ -52,113 +53,104 @@ def telegram_send(message):
         logger.error(f"Telegram Error: {e}")
         return False
 
-def parse_price(value):
-    if value is None: return None
-    value = re.sub(r"(SAR|ر\.س|ريال|AED|USD|\$|€|£)", "", str(value), flags=re.I)
-    value = re.sub(r"[^\d,\.]", "", value)
-    if not value: return None
-    try:
-        if "," in value and "." in value:
-            if value.rfind(",") > value.rfind("."):
-                value = value.replace(".", "").replace(",", ".")
-            else:
-                value = value.replace(",", "")
-        elif "," in value:
-            parts = value.split(",")
-            if len(parts[-1]) == 2:
-                value = value.replace(",", ".")
-            else:
-                value = value.replace(",", "")
-        return float(value)
-    except Exception:
-        return None
+def parse_price(val):
+    if not val: return None
+    cleaned = re.sub(r"[^\d\.]", "", str(val).replace(",", ""))
+    try: return float(cleaned)
+    except: return None
 
-def fetch_fast(target_url):
-    payload = {'api_key': SCRAPER_API_KEY, 'url': target_url, 'country_code': 'sa', 'device_type': 'desktop'}
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'}
+def fetch_fast(url):
+    payload = {'api_key': SCRAPER_API_KEY, 'url': url, 'country_code': 'sa'}
     try:
-        resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=12)
+        resp = session.get('http://api.scraperapi.com', params=payload, timeout=12)
         if resp.status_code == 200:
             return resp.text
     except Exception:
         pass
     return None
 
-def parse_and_send_amazon_deals(html):
+def parse_and_send_deals(html):
     if not html: return 0
     soup = BeautifulSoup(html, "lxml")
-    cards = soup.select(
-        "div[id^='post-'], "
-        "div[class*='zg-grid-general-faceout'], "
-        "div[class*='p13n-sc-unselected-item'], "
-        "div[data-component-type='s-search-result'], "
-        "div.p13n-grid-content, "
-        "div.grid-item"
-    )
-
+    cards = soup.select("div[class*='productContainer'], span[class*='productBlock'], div.sc-2023ee08-0, div[class*='minutesCard'], div[class*='grid'] > div")
+    
     found_in_page = 0
     for card in cards:
         try:
-            name_tag = card.select_one("div._cDE1C_truncate_3qMTh, span.zg-text-js-truncate, a.a-link-normal span, h2 span")
-            price_tag = card.select_one("span._cDE1C_p13n-sc-price_3m33M, span.a-price span.a-offscreen, span.p13n-sc-price")
-            old_price_tag = card.select_one("span.a-text-price span.a-offscreen, span.a-color-secondary.a-text-strike")
-            link_tag = card.select_one("a.a-link-normal[href*='/dp/'], a.a-link-normal")
+            title_tag = card.select_one("div[data-qa='product-name'], [class*='title'], [class*='name']")
+            curr_price_tag = card.select_one("strong[class*='amount'], span[class*='currency'] + strong, [class*='price']")
+            old_price_tag = card.select_one("span[class*='oldPrice'], span[class*='strike']")
+            link_tag = card.select_one("a")
 
-            if name_tag and price_tag and old_price_tag and link_tag:
-                name = name_tag.get_text(strip=True)[:120]
-                price = parse_price(price_tag.get_text(strip=True))
-                old_price = parse_price(old_price_tag.get_text(strip=True))
-                raw_url = link_tag.get("href", "")
+            if title_tag and curr_price_tag and old_price_tag and link_tag:
+                title = title_tag.get_text(strip=True)[:120]
+                price = parse_price(curr_price_tag.get_text())
+                old_price = parse_price(old_price_tag.get_text())
+                href = link_tag.get("href", "")
 
                 if price and old_price and old_price > price:
                     discount = ((old_price - price) / old_price) * 100
-
+                    
                     if discount >= MIN_DISCOUNT_PERCENT:
-                        clean_url = "https://www.amazon.sa" + raw_url if raw_url.startswith("/") else raw_url.split("?")[0]
-                        asin_match = re.search(r"/(dp|gp/product)/([A-Z0-9]{10})", clean_url)
-                        pid = asin_match.group(2) if asin_match else hashlib.md5(clean_url.encode()).hexdigest()[:10]
-
+                        full_url = href if "minutes.noon.com" in href else f"https://www.noon.com{href}"
+                        sku_match = re.search(r"/([A-Z0-9]+)/p", full_url)
+                        pid = sku_match.group(1) if sku_match else hashlib.md5(full_url.encode()).hexdigest()[:10]
+                        
                         alert_key = f"{pid}_{price}"
                         if alert_key not in sent_alerts:
                             sent_alerts.add(alert_key)
                             found_in_page += 1
-
+                            
+                            badge = "⚡️ <b>[نون مينتس]</b>\n" if "minutes" in full_url else "🔥 <b>[تخفيضات نون]</b>\n"
                             msg = (
-                                f"💥 <b>صيدة جديدة من أمازون (خصم {round(discount)}%)!</b> 💥\n\n"
-                                f"🛍 <b>المنتج:</b> {name}\n"
+                                f"💛 <b>صيدة جديدة (خصم {round(discount)}%)!</b> 💛\n"
+                                f"{badge}"
+                                f"🛍 <b>المنتج:</b> {title}\n"
                                 f"💰 <b>السعر الآن:</b> {price} ر.س\n"
-                                f"📈 <b>السعر الأصلي:</b> {old_price} ر.س\n\n"
-                                f"🔗 <b>رابط الشراء المباشر:</b>\n{clean_url}"
+                                f"📈 <b>السعر قبل:</b> {old_price} ر.س\n\n"
+                                f"🔗 <b>رابط الشراء المباشر:</b>\n{full_url}"
                             )
                             telegram_send(msg)
-                            time.sleep(0.5)
+                            time.sleep(0.3)
         except Exception:
             continue
     return found_in_page
 
 def run_fast_scan():
-    global is_scanning, amazon_current_page
+    global is_scanning, start_page, end_page
     if is_scanning: return
 
     with scan_lock: is_scanning = True
-    telegram_send(f"⚡️ <b>بدأ فحص أمازون لصفحة رقم [{amazon_current_page} من {MAX_PAGES_TO_SCAN}].. جاري البحث!</b>")
+    telegram_send(f"⚡️ <b>بدأ فحص نون للشريحة من صفحة [{start_page}] إلى [{end_page}].. جاري البحث!</b>")
 
+    # 🚀 إنتاج 15 صفحة لكل قسم
     target_urls = []
-    for u in BASE_AMAZON_URLS:
-        delimiter = "&" if "?" in u else "?"
-        target_urls.append(f"{u}{delimiter}pg={amazon_current_page}")
+    for p in range(start_page, end_page + 1):
+        for u in BASE_NOON_URLS:
+            if "minutes.noon.com" in u:
+                if p == start_page: target_urls.append(u)
+            else:
+                delimiter = "&" if "?" in u else "?"
+                target_urls.append(f"{u}{delimiter}page={p}")
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # فحص موازي باستخدام 10 مسارات
+    with ThreadPoolExecutor(max_workers=10) as executor:
         html_results = list(executor.map(fetch_fast, target_urls))
 
     total_sent = 0
     for html in html_results:
-        total_sent += parse_and_send_amazon_deals(html)
+        total_sent += parse_and_send_deals(html)
 
-    telegram_send(f"✅ <b>انتهى فحص أمازون لصفحة [{amazon_current_page}]!</b> تم إرسال <b>{total_sent}</b> صيدة.\n💡 الفحص القادم سيبدأ تلقائياً من الصفحة [{amazon_current_page + 1}].")
+    telegram_send(f"✅ <b>انتهى فحص الصفحات من [{start_page}] إلى [{end_page}]!</b>\nتم إرسال <b>{total_sent}</b> صيدة.\n💡 الفحص القادم سيبدأ من الصفحة [{end_page + 1}] إلى [{end_page + CHUNK_SIZE}].")
     
-    # 🔄 الانتقال للصفحة التالية حتى الوصول لـ 10 صفحات ثم إعادة التدوير من الصفحة الأولى
-    amazon_current_page = amazon_current_page + 1 if amazon_current_page < MAX_PAGES_TO_SCAN else 1
+    # 🔄 تحديث الصفحة للدفعة القادمة (16-30، ثم 31-45، وهكذا لغاية 60)
+    start_page = end_page + 1
+    end_page = start_page + CHUNK_SIZE - 1
+    
+    if start_page > 60:
+        start_page = 1
+        end_page = 15
+
     is_scanning = False
 
 def telegram_listener():
@@ -183,9 +175,9 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "amazon_10pages_online", "current_page": amazon_current_page, "max_pages": MAX_PAGES_TO_SCAN})
+    return jsonify({"status": "noon_15chunk_online", "next_start_page": start_page, "next_end_page": end_page})
 
 if __name__ == "__main__":
-    telegram_send("🚀 <b>تم تشغيل بوت أمازون (10 صفحات)! أرسلي /scan للبدء وسيكمل الصفحات بالتتابع.</b>")
+    telegram_send("🚀 <b>تم تشغيل بوت نون (نظام الـ 15 صفحة)! أرسلي /scan للبدء.</b>")
     threading.Thread(target=telegram_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
