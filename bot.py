@@ -11,19 +11,16 @@ import requests
 from flask import Flask, jsonify
 from bs4 import BeautifulSoup
 
-# ============================================================
-# SETTINGS & CONFIGURATION
-# ============================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
 CHAT_ID = os.environ.get("CHAT_ID", "432826122")
 SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 
 MIN_DISCOUNT_PERCENT = 70.0  
+MAX_PAGES_TO_SCAN = 10  # 🎯 تم ضبط نطاق البحث ليشمل 10 صفحات كاملة
+
 is_scanning = False
 scan_lock = threading.Lock()
 sent_alerts = set()
-
-# 🎯 عداد حفظ الصفحة الحالية لأمازون (يبدأ من 1 ويكمل تلقائياً)
 amazon_current_page = 1
 
 BASE_AMAZON_URLS = [
@@ -38,7 +35,7 @@ BASE_AMAZON_URLS = [
 ]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("amazon_paged")
+logger = logging.getLogger("amazon_10pages")
 app = Flask(__name__)
 session = requests.Session()
 
@@ -144,9 +141,8 @@ def run_fast_scan():
     if is_scanning: return
 
     with scan_lock: is_scanning = True
-    telegram_send(f"⚡️ <b>بدأ فحص أمازون لصفحة رقم [{amazon_current_page}].. جاري البحث!</b>")
+    telegram_send(f"⚡️ <b>بدأ فحص أمازون لصفحة رقم [{amazon_current_page} من {MAX_PAGES_TO_SCAN}].. جاري البحث!</b>")
 
-    # 🔗 إضافة بارامتر رقم الصفحة pg لكل قسم
     target_urls = []
     for u in BASE_AMAZON_URLS:
         delimiter = "&" if "?" in u else "?"
@@ -161,8 +157,8 @@ def run_fast_scan():
 
     telegram_send(f"✅ <b>انتهى فحص أمازون لصفحة [{amazon_current_page}]!</b> تم إرسال <b>{total_sent}</b> صيدة.\n💡 الفحص القادم سيبدأ تلقائياً من الصفحة [{amazon_current_page + 1}].")
     
-    # 🔄 الانتقال للصفحة التالية (حتى الصفحة 10 ثم العودة للصفحة الأولى)
-    amazon_current_page = amazon_current_page + 1 if amazon_current_page < 10 else 1
+    # 🔄 الانتقال للصفحة التالية حتى الوصول لـ 10 صفحات ثم إعادة التدوير من الصفحة الأولى
+    amazon_current_page = amazon_current_page + 1 if amazon_current_page < MAX_PAGES_TO_SCAN else 1
     is_scanning = False
 
 def telegram_listener():
@@ -187,9 +183,9 @@ def telegram_listener():
 
 @app.route("/")
 def home():
-    return jsonify({"status": "amazon_paged_online", "current_page": amazon_current_page})
+    return jsonify({"status": "amazon_10pages_online", "current_page": amazon_current_page, "max_pages": MAX_PAGES_TO_SCAN})
 
 if __name__ == "__main__":
-    telegram_send("🚀 <b>تم تشغيل بوت أمازون المطور! أرسلي /scan للبدء وسيكمل الصفحات بالتتابع.</b>")
+    telegram_send("🚀 <b>تم تشغيل بوت أمازون (10 صفحات)! أرسلي /scan للبدء وسيكمل الصفحات بالتتابع.</b>")
     threading.Thread(target=telegram_listener, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
