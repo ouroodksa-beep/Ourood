@@ -1,15 +1,12 @@
 import os
 import re
-import json
 import sqlite3
 import logging
 import requests
-import cloudscraper
 from datetime import datetime
 from bs4 import BeautifulSoup
 from telegram import Bot
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from fake_useragent import UserAgent
+from telegram.ext import Updater
 import time
 import random
 import hashlib
@@ -26,11 +23,11 @@ logger = logging.getLogger(__name__)
 # ========== Configurations ==========
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "432826122")
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 PORT = int(os.environ.get("PORT", 8080))
 
-# تعديل الشروط لتسهيل العثور على العروض وإرسالها
-SUPER_DISCOUNT_THRESHOLD = 50.0  # إرسال فوراً إذا كان الخصم 50% أو أكثر
-AVERAGE_DISCOUNT_THRESHOLD = 40.0 # إرسال إذا نزل السعر 40% عن متوسط السعر المسجل
+SUPER_DISCOUNT_THRESHOLD = 50.0  
+AVERAGE_DISCOUNT_THRESHOLD = 40.0 
 
 # ========== Flask Server ==========
 app = Flask(__name__)
@@ -99,7 +96,6 @@ def update_product_and_check(deal):
     else:
         old_avg = row[1]
         count = row[2]
-        
         new_count = count + 1
         new_avg = ((old_avg * count) + price) / new_count
         
@@ -131,34 +127,30 @@ def update_product_and_check(deal):
 
     conn.commit()
     conn.close()
-    
     return should_send, reason
 
-# ========== Scraper Setup ==========
-ua = UserAgent()
-
+# ========== Scraper Setup with ScraperAPI ==========
 CATEGORIES_NOON = [
-    ("https://www.noon.com/saudi-en/electronics-and-mobile/", "📱 Beauty Best Seller"),
+    ("https://www.noon.com/saudi-en/beauty-and-fragrances/", "💄 Beauty Best Seller"),
     ("https://www.noon.com/saudi-en/home-and-kitchen/", "🍳 Kitchen Best Seller"),
     ("https://www.noon.com/saudi-en/home-and-kitchen/", "🏠 Home Best Seller"),
     ("https://www.noon.com/saudi-en/electronics-and-mobile/", "📱 Mobile Best Seller"),
     ("https://www.noon.com/saudi-en/beauty-and-fragrances/", "🌸 Perfumes Best Seller"),
-    ("https://www.noon.com/saudi-en/electronics-and-mobile/", "⚡ Appliances Best Seller"),
-    ("https://www.noon.com/saudi-en/electronics-and-mobile/", "💻 Computers Best Seller"),
-    ("https://www.noon.com/saudi-en/fashion/", "⌚ Watches Best Seller")
+    ("https://www.noon.com/saudi-en/electronics-and-mobile/", "⚡ Appliances Best Seller")
 ]
 
-def fetch_noon_category(session, base_url, category_name):
+def fetch_noon_category(target_url, category_name):
     deals = []
-    url = f"{base_url}?sort%5Bby%5D=is_bestseller&sort%5Bdir%5D=desc&limit=50"
+    url = f"{target_url}?sort%5Bby%5D=is_bestseller&sort%5Bdir%5D=desc&limit=50"
     
+    # استخدام ScraperAPI لتفادي الـ Timeout والـ Block
+    if SCRAPER_API_KEY and SCRAPER_API_KEY != "ضع_مفتاح_SCRAPERAPI_هنا":
+        api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={url}&country_code=sa"
+    else:
+        api_url = url
+
     try:
-        headers = {
-            'User-Agent': ua.random,
-            'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8',
-            'Referer': 'https://www.noon.com/saudi-ar/',
-        }
-        r = session.get(url, headers=headers, timeout=20)
+        r = requests.get(api_url, timeout=60)
         
         if r.status_code == 200:
             soup = BeautifulSoup(r.text, 'html.parser')
@@ -244,23 +236,21 @@ def send_telegram_alert(bot, deal, reason):
 # ========== Automated Background Scanner Loop ==========
 def auto_monitor_loop(bot):
     logger.info("⚡ Auto Monitor loop started...")
-    session = cloudscraper.create_scraper()
     
     while True:
         try:
             for base_url, category_name in CATEGORIES_NOON:
-                logger.info(f"Scanning category: 💄 {category_name}")
-                deals = fetch_noon_category(session, base_url, category_name)
+                logger.info(f"Scanning category: {category_name}")
+                deals = fetch_noon_category(base_url, category_name)
                 
                 for deal in deals:
                     should_send, reason = update_product_and_check(deal)
-                    
                     if should_send:
                         logger.info(f"🎯 Alert triggered for {deal['title']}")
                         send_telegram_alert(bot, deal, reason)
                         time.sleep(2)
                 
-                time.sleep(random.uniform(3, 6))
+                time.sleep(random.uniform(4, 8))
                 
             logger.info("Finished one full scan cycle. Retrying in 60 seconds...")
             time.sleep(60)
