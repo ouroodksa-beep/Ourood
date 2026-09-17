@@ -1,255 +1,340 @@
 import os
-import sys
-import time
 import re
+import json
+import logging
+import requests
+import cloudscraper
+import sqlite3
+import time
+import random
 import hashlib
 import threading
-import logging
-from concurrent.futures import ThreadPoolExecutor
-
-import requests
-from flask import Flask, jsonify
+from datetime import datetime
 from bs4 import BeautifulSoup
+from telegram import Bot
+from fake_useragent import UserAgent
+from flask import Flask
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8769441239:AAFUuBQxj-9q-xhYFGEW6yNWT2xWzvAA")
-CHAT_ID = os.environ.get("CHAT_ID", "432826122")
-SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
+# ========== الإعدادات العامة وتسجيل اللوج ==========
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# 📌 الالتزام التام بنسبة 70% بدون أي تغيير
-MIN_DISCOUNT_PERCENT = 70.0  
-TARGET_DEALS_COUNT = 30
-CHUNK_SIZE = 5  
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q-xhYFGEW6yNWT2xWzvAA")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "432826122")
+PORT = int(os.environ.get("PORT", 8080))
 
-is_scanning = False
-scan_lock = threading.Lock()
-sent_alerts = set()
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
+ua = UserAgent()
 
-amazon_start_page = 1
-amazon_end_page = 5
+# ========== Flask App للتشغيل المستمر على Render ==========
+app = Flask(__name__)
 
-# روابط أمازون السعودية المخصصة للتصفيات والخصومات الفائقة (70% فأكثر)
-BASE_AMAZON_URLS = [
-    "https://www.amazon.sa/s?i=electronics&rh=p_8%3A70-&fs=true",
-    "https://www.amazon.sa/s?i=mobile-phones&rh=p_8%3A70-&fs=true",
-    "https://www.amazon.sa/s?i=kitchen&rh=p_8%3A70-&fs=true",
-    "https://www.amazon.sa/s?i=beauty&rh=p_8%3A70-&fs=true",
-    "https://www.amazon.sa/s?i=fashion&rh=p_8%3A70-&fs=true",
-    "https://www.amazon.sa/s?i=appliances&rh=p_8%3A70-&fs=true"
+@app.route('/')
+def home():
+    return "Amazon Auto Deals Bot is Running!", 200
+
+@app.route('/health')
+def health():
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}, 200
+
+def run_flask():
+    app.run(host='0.0.0.0', port=PORT)
+
+# ========== إدارة قاعدة البيانات (سجل الأسعار والصفقات) ==========
+DB_FILE = "deals_history.db"
+
+def init_db():
+    """إنشاء قاعدة البيانات لتتبع الأسعار والمنتجات المرسلة"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # جدول المنتجات المرسلة منعاً للتكرار
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sent_products (
+            asin TEXT PRIMARY KEY,
+            title TEXT,
+            sent_at TIMESTAMP
+        )
+    ''')
+    
+    # جدول سجّل الأسعار لتحديد انخفاض السعر المفاجئ ومتوسط السعر
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS price_history (
+            asin TEXT,
+            price REAL,
+            recorded_at TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def is_already_sent(asin):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM sent_products WHERE asin = ?", (asin,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def mark_as_sent(asin, title):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO sent_products VALUES (?, ?, ?)", 
+                   (asin, title, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def record_price_and_check_drop(asin, current_price):
+    """تسجيل السعر والتحقق مما إذا كان السعر الحالي ينخفض بأكثر من 65% عن متوسط السعر السابق"""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT price FROM price_history WHERE asin = ?", (asin,))
+    prices = [row[0] for row in cursor.fetchall()]
+    
+    # إضافة السعر الحالي للسجل
+    cursor.execute("INSERT INTO price_history VALUES (?, ?, ?)", 
+                   (asin, current_price, datetime.now().isoformat()))
+    conn.commit()
+    
+    if not prices:
+        conn.close()
+        return False, 0
+    
+    avg_price = sum(prices) / len(prices)
+    conn.close()
+    
+    if avg_price > 0:
+        price_drop_percent = ((avg_price - current_price) / avg_price) * 100
+        # إذا كان الانخفاض عن المتوسط أكثر من 65% (مثال: من 4000 إلى 1400)
+        if price_drop_percent >= 65:
+            return True, round(price_drop_percent, 1)
+            
+    return False, 0
+
+# ========== قائمة الأقسام (الأكثر مبيعا + Amazon Yalla) ==========
+CATEGORIES = [
+    # رابط Yalla / Everyday Deals المطلوب
+    ("https://www.amazon.sa/-/en/tez/browse/?_encoding=UTF8&qcbrand=sAuWWBROaG&ref_=mwb_sn_logo_yalla", "🚀 Yalla Everyday Deals"),
+    
+    # أقسام الأكثر مبيعاً (Best Sellers)
+    ("https://www.amazon.sa/gp/bestsellers/electronics", "📱 Electronics Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/fashion", "👕 Fashion Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/beauty", "💄 Beauty Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/kitchen", "🍳 Kitchen Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/home", "🏠 Home Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/mobile", "📱 Mobile Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/perfumes", "🌸 Perfumes Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/appliances", "⚡ Appliances Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/computers", "💻 Computers Best Seller"),
+    ("https://www.amazon.sa/gp/bestsellers/watches", "⌚ Watches Best Seller"),
+    
+    # أقسام الخصومات والتصفية
+    ("https://www.amazon.sa/gp/goldbox", "🔥 Goldbox Deals"),
+    ("https://www.amazon.sa/outlet", "🎁 Outlet Clearance"),
+    ("https://www.amazon.sa/gp/warehouse-deals", "🏭 Warehouse Deals")
 ]
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-logger = logging.getLogger("amazon_strict_70")
-app = Flask(__name__)
-session = requests.Session()
+# ========== أدوات الاستخراج والتحليل ==========
+def create_session():
+    session = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True},
+        delay=10
+    )
+    session.headers.update({
+        'User-Agent': ua.random,
+        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8',
+        'Referer': 'https://www.amazon.sa/',
+    })
+    return session
 
-def telegram_send(message):
-    if not BOT_TOKEN or not CHAT_ID: return False
-    try:
-        r = session.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10
-        )
-        return r.status_code == 200
-    except Exception as e:
-        logger.error(f"Telegram Error: {e}")
-        return False
-
-def parse_price(value):
-    if value is None: return None
-    value = re.sub(r"(SAR|ر\.س|ريال|AED|USD|\$|€|£)", "", str(value), flags=re.I)
-    value = re.sub(r"[^\d,\.]", "", value)
-    if not value: return None
-    try:
-        if "," in value and "." in value:
-            if value.rfind(",") > value.rfind("."):
-                value = value.replace(".", "").replace(",", ".")
-            else:
-                value = value.replace(",", "")
-        elif "," in value:
-            parts = value.split(",")
-            if len(parts[-1]) == 2:
-                value = value.replace(",", ".")
-            else:
-                value = value.replace(",", "")
-        return float(value)
-    except Exception:
+def extract_asin(link):
+    if not link:
         return None
-
-def fetch_anti_bot(target_url):
-    payload = {
-        'api_key': SCRAPER_API_KEY, 
-        'url': target_url, 
-        'country_code': 'sa',
-        'keep_headers': 'true'
-    }
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        'Accept-Language': 'ar-SA,ar;q=0.9,en-US;q=0.8,en;q=0.7'
-    }
-    try:
-        resp = session.get('http://api.scraperapi.com', params=payload, headers=headers, timeout=25)
-        if resp.status_code == 200 and len(resp.text) > 8000:
-            return resp.text
-    except Exception as e:
-        logger.error(f"Fetch Error: {e}")
+    patterns = [r'/dp/([A-Z0-9]{10})', r'/gp/product/([A-Z0-9]{10})', r'product/([A-Z0-9]{10})']
+    for p in patterns:
+        match = re.search(p, link, re.I)
+        if match:
+            return match.group(1).upper()
     return None
 
-def parse_and_send_amazon_deals(html):
-    if not html: return 0, 0
-    soup = BeautifulSoup(html, "lxml")
-    
-    cards = soup.select("div[data-component-type='s-search-result']")
-    total_cards = len(cards)
-    deals_sent = 0
-
-    for card in cards:
-        try:
-            name_tag = card.select_one("h2 a span, span.a-size-base-plus, span.a-size-medium")
-            link_tag = card.select_one("h2 a.a-link-normal, a.a-link-normal[href*='/dp/']")
-
-            if not (name_tag and link_tag):
-                continue
-
-            name = name_tag.get_text(strip=True)[:100]
-            raw_url = link_tag.get("href", "")
-
-            # 1. استخراج كل عناصر الأسعار الممكنة داخل الكارت
-            all_price_texts = [p.get_text(strip=True) for p in card.select("span.a-offscreen")]
-            
-            price = None
-            old_price = None
-            
-            parsed_prices = [parse_price(p) for p in all_price_texts if parse_price(p) is not None]
-            parsed_prices = sorted(list(set(parsed_prices)))  # ترتيب الأرقام تصاعدياً
-
-            if len(parsed_prices) >= 2:
-                price = parsed_prices[0]
-                old_price = parsed_prices[-1]
-            elif len(parsed_prices) == 1:
-                price = parsed_prices[0]
-
-            # 2. حساب نسبة الخصم الفعلية
-            discount = 0.0
-            if price and old_price and old_price > price:
-                discount = ((old_price - price) / old_price) * 100
-
-            # 3. التحقق الاحتياطي من وجود شارة الخصم الصريحة (مثل: خصم 70% أو 75%-)
-            if discount < MIN_DISCOUNT_PERCENT:
-                card_text = card.get_text()
-                match_disc = re.search(r"(خصم\s*(\d+)%|(\d+)%\s*off|-(\d+)%)", card_text, re.I)
-                if match_disc:
-                    found_disc = float(next(g for g in match_disc.groups() if g and g.isdigit()))
-                    if found_disc >= MIN_DISCOUNT_PERCENT:
-                        discount = found_disc
-                        if price and not old_price:
-                            old_price = round(price / (1 - (discount / 100)), 2)
-
-            # 🎯 تفعيل الشرط الصارم: 70% أو أكثر فقط
-            if discount >= MIN_DISCOUNT_PERCENT and price:
-                clean_url = "https://www.amazon.sa" + raw_url if raw_url.startswith("/") else raw_url.split("?")[0]
-                asin = card.get("data-asin", "") or hashlib.md5(clean_url.encode()).hexdigest()[:10]
-
-                alert_key = f"{asin}_{price}"
-                if alert_key not in sent_alerts:
-                    sent_alerts.add(alert_key)
-                    deals_sent += 1
-
-                    msg = (
-                        f"💥 <b>صيدة أمازون قوية (خصم {round(discount)}%)!</b> 💥\n\n"
-                        f"🛍 <b>المنتج:</b> {name}\n"
-                        f"💰 <b>السعر بعد الخصم:</b> {price} ر.س\n"
-                        f"📈 <b>السعر قبل الخصم:</b> {old_price if old_price else 'غير محدد'} ر.س\n\n"
-                        f"🔗 <b>رابط الشراء المباشر:</b>\n{clean_url}"
-                    )
-                    telegram_send(msg)
-                    time.sleep(0.3)
-        except Exception:
-            continue
-            
-    return total_cards, deals_sent
-
-def run_until_target_found():
-    global is_scanning, amazon_start_page, amazon_end_page
-    if is_scanning: return
-
-    with scan_lock: is_scanning = True
-    telegram_send("🚀 <b>بدأ فحص أمازون المتقدم (بالالتزام الكامل بنسبة خصم 70%+)...</b>")
-
-    total_deals_found = 0
-    rounds_count = 0
-
-    while total_deals_found < TARGET_DEALS_COUNT:
-        rounds_count += 1
-
-        target_urls = []
-        for p in range(amazon_start_page, amazon_end_page + 1):
-            for u in BASE_AMAZON_URLS:
-                delimiter = "&" if "?" in u else "?"
-                target_urls.append(f"{u}{delimiter}page={p}")
-
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            html_results = list(executor.map(fetch_anti_bot, target_urls))
-
-        round_found = 0
-        total_cards_scanned = 0
-        valid_pages_count = 0
-
-        for html in html_results:
-            if html:
-                valid_pages_count += 1
-                cards_cnt, deals_cnt = parse_and_send_amazon_deals(html)
-                total_cards_scanned += cards_cnt
-                round_found += deals_cnt
-
-        total_deals_found += round_found
+def parse_item(item, category_name):
+    try:
+        # استخراج السعر الحالي
+        price = None
+        for sel in ['.a-price-whole', '.a-price .a-offscreen', '.a-price']:
+            el = item.select_one(sel)
+            if el:
+                txt = el.text.replace(',', '').replace('ريال', '').replace('SAR', '').strip()
+                match = re.search(r'[\d,]+\.?\d*', txt)
+                if match:
+                    price = float(match.group().replace(',', ''))
+                    break
         
-        telegram_send(
-            f"📊 <b>تقرير الجولة {rounds_count}:</b>\n"
-            f"• الصفحات المجلوبة: {valid_pages_count} من {len(target_urls)}\n"
-            f"• إجمالي المنتجات المفحوصة: {total_cards_scanned}\n"
-            f"• الصيدات المطابقة لشرط (70%+): {round_found}\n"
-            f"• الإجمالي الكلي حتى الآن: {total_deals_found}/{TARGET_DEALS_COUNT}"
-        )
+        if not price or price <= 0:
+            return None
 
-        amazon_start_page = amazon_end_page + 1
-        amazon_end_page = amazon_start_page + CHUNK_SIZE - 1
+        # استخراج السعر القديم ونسبة الخصم
+        old_price = 0
+        discount = 0
+        
+        old_el = item.find('span', class_='a-text-price')
+        if old_el:
+            txt = old_el.get_text()
+            match = re.search(r'[\d,]+\.?\d*', txt.replace(',', ''))
+            if match:
+                old_price = float(match.group())
+                if old_price > price:
+                    discount = int(((old_price - price) / old_price) * 100)
 
-        if amazon_start_page > 30:
-            amazon_start_page = 1
-            amazon_end_page = 5
+        # استخراج نسبة الخصم من الشارات إن وجدت
+        if discount == 0:
+            badge = item.find(string=re.compile(r'(\d+)%'))
+            if badge:
+                match = re.search(r'(\d+)', str(badge))
+                if match:
+                    discount = int(match.group())
+                    if price > 0 and discount < 100:
+                        old_price = price / (1 - discount/100)
 
-        if total_deals_found < TARGET_DEALS_COUNT:
-            time.sleep(2)
+        # استخراج العنوان والرابط
+        title = "منتج مميز"
+        for sel in ['h2 a span', 'h2 span', '.a-size-base-plus', '.p13n-sc-truncated', '.a-size-medium']:
+            el = item.select_one(sel)
+            if el:
+                title = el.text.strip()
+                break
 
-    telegram_send(f"🎉 <b>تم الوصول للهدف!</b> تم إرسال {total_deals_found} صيدة بخصم 70%+.")
-    is_scanning = False
+        link = ""
+        a = item.find('a', href=True)
+        if a:
+            href = a['href']
+            if href.startswith('/'):
+                link = f"https://www.amazon.sa{href}"
+            elif 'amazon.sa' in href:
+                link = href
 
-def telegram_listener():
-    last_update_id = 0
+        asin = extract_asin(link)
+        if not asin:
+            return None
+
+        # استخراج الصورة
+        img = ""
+        el_img = item.select_one('img.s-image, img[src]')
+        if el_img:
+            img = el_img.get('src', '') or el_img.get('data-src', '')
+
+        return {
+            'asin': asin,
+            'title': title,
+            'price': price,
+            'old_price': round(old_price, 2),
+            'discount': discount,
+            'link': link,
+            'image': img,
+            'category': category_name
+        }
+    except Exception as e:
+        return None
+
+# ========== المحرك الأساسي للمسح التلقائي ==========
+def auto_scanner_loop():
+    logger.info("🚀 Auto-scanner loop started...")
+    session = create_session()
+
     while True:
-        try:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
-            resp = session.get(url, params={"offset": last_update_id + 1, "timeout": 20}, timeout=25)
-            if resp.status_code == 200 and resp.json().get("ok"):
-                for update in resp.json().get("result", []):
-                    last_update_id = update["update_id"]
-                    text = update.get("message", {}).get("text", "").strip()
+        for url, cat_name in CATEGORIES:
+            try:
+                logger.info(f"🔍 Scanning category: {cat_name}")
+                response = session.get(url, timeout=20)
+                
+                if response.status_code != 200:
+                    time.sleep(3)
+                    continue
 
-                    if text in ["/scan", "/scan@"]:
-                        if is_scanning:
-                            telegram_send("⏳ <b>جاري البحث حالياً.. يرجى الانتظار.</b>")
-                        else:
-                            threading.Thread(target=run_until_target_found, daemon=True).start()
-        except Exception:
-            pass
-        time.sleep(2)
+                soup = BeautifulSoup(response.text, 'html.parser')
+                
+                # جمع العناصر
+                items = []
+                items.extend(soup.find_all('div', {'data-component-type': 's-search-result'}))
+                items.extend(soup.find_all('li', class_='zg-item-immersion'))
+                items.extend(soup.find_all('div', class_='p13n-sc-uncoverable-faceout'))
+                items.extend(soup.find_all('div', {'data-testid': 'deal-card'}))
 
-@app.route("/")
-def home():
-    return jsonify({"status": "amazon_strict_70_active", "start": amazon_start_page, "end": amazon_end_page})
+                for item in items:
+                    deal = parse_item(item, cat_name)
+                    if not deal:
+                        continue
 
+                    asin = deal['asin']
+
+                    # التحقق مما إذا تم إرسال المنتج سابقاً
+                    if is_already_sent(asin):
+                        continue
+
+                    # فحص انخفاض السعر التاريخي من قاعدة البيانات
+                    is_price_drop, drop_percent = record_price_and_check_drop(asin, deal['price'])
+
+                    # الشرط الرئيسي لإرسال العرض:
+                    # 1. نسبة الخصم المباشرة 80% أو أكثر
+                    # 2. أَوْ انخفاض مفاجئ وممتاز في السعر التاريخي للقطعة (أكثر من 65%)
+                    should_send = (deal['discount'] >= 80) or is_price_drop
+
+                    if should_send:
+                        send_telegram_deal(deal, is_price_drop, drop_percent)
+                        mark_as_sent(asin, deal['title'])
+                        time.sleep(2) # مهلة بسيطة لتجنب السبام
+
+                time.sleep(random.uniform(2, 5))
+
+            except Exception as e:
+                logger.error(f"Error scanning {cat_name}: {e}")
+                time.sleep(5)
+
+        logger.info("🔄 Finished one full scan cycle. Retrying in 60 seconds...")
+        time.sleep(60)
+
+def send_telegram_deal(deal, is_price_drop=False, drop_percent=0):
+    """إرسال الصفقة فوراً إلى قناتك أو حسابك في تلجرام"""
+    try:
+        tag = "🔥 خصم خارق (فوق 80%)" if deal['discount'] >= 80 else f"📉 انخفاض سعر تاريخي ({drop_percent}%)"
+        
+        old_price_str = f"🏷️ *قبل:* {deal['old_price']:.2f} ريال\n" if deal['old_price'] > 0 else ""
+        savings = (deal['old_price'] - deal['price']) if deal['old_price'] > deal['price'] else 0
+        savings_str = f"💵 *التوفير:* {savings:.2f} ريال\n" if savings > 0 else ""
+
+        caption = f"""
+{tag}
+
+📦 *{deal['title'][:120]}*
+
+💵 *السعر الحالي:* {deal['price']:.2f} ريال
+{old_price_str}{savings_str}📉 *نسبة الخصم:* {deal['discount']}%
+📍 *القسم:* {deal['category']}
+
+🔗 [اضغط هنا للشراء من أمازون]({deal['link']})
+        """
+
+        if deal['image'] and deal['image'].startswith('http'):
+            bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=deal['image'], caption=caption, parse_mode='Markdown')
+        else:
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode='Markdown')
+
+        logger.info(f"✅ Deal sent to Telegram: {deal['title'][:30]}")
+    except Exception as e:
+        logger.error(f"Failed to send deal to Telegram: {e}")
+
+# ========== التشغيل الرئيسي ==========
 if __name__ == "__main__":
-    telegram_send("🚀 <b>تم تشغيل البوت المخصص للخصومات الفائقة (70%+)! أرسلي /scan للبدء.</b>")
-    threading.Thread(target=telegram_listener, daemon=True).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    init_db()
+
+    # تشغيل سيرفر Flask في Thread منفصل للحفاظ على نشاط البوت على Render
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # تشغيل محرك المسح التلقائي المباشر
+    auto_scanner_loop()
