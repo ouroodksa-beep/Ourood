@@ -6,7 +6,7 @@ import requests
 from datetime import datetime
 from bs4 import BeautifulSoup
 from telegram import Bot
-from telegram.ext import Updater
+from telegram.ext import Updater, CommandHandler
 import time
 import random
 import hashlib
@@ -26,8 +26,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "432826122")
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 PORT = int(os.environ.get("PORT", 8080))
 
-SUPER_DISCOUNT_THRESHOLD = 70.0  # إرسال لو الخصم 50% أو أكثر
-AVERAGE_DISCOUNT_THRESHOLD = 40.0 # إرسال لو انخفض 40% عن المتوسط
+# نسبة الخصم ثابتة كما هي
+SUPER_DISCOUNT_THRESHOLD = 70.0  
+AVERAGE_DISCOUNT_THRESHOLD = 40.0 
 
 # ========== Flask Server ==========
 app = Flask(__name__)
@@ -259,6 +260,20 @@ def send_telegram_alert(bot, deal, reason):
     except Exception as e:
         logger.error(f"Failed to send alert to Telegram: {e}")
 
+# ========== Telegram Bot Command Handlers ==========
+def start_command(update, context):
+    update.message.reply_text("👋 أهلاً بك! البوت يعمل الآن ويقوم بمراقبة أحدث عروض وصيدات أمازون السعودية في الخلفية بنجاح.")
+
+def test_command(update, context):
+    update.message.reply_text("🔍 جاري جلب عينة اختبارية من أقسام أمازون الآن...")
+    url, cat_name = CATEGORIES_AMAZON[0]
+    deals = fetch_amazon_category(url, cat_name)
+    if deals:
+        d = deals[0]
+        update.message.reply_text(f"✅ تم سحب بيانات بنجاح:\n\n📦 {d['title'][:80]}\n💵 السعر: {d['price']} ريال\n💥 الخصم: {d['discount']}%")
+    else:
+        update.message.reply_text("⚠️ لم يتم العثور على منتجات في الصفحة المختبرة حالياً، تأكدي من ScraperAPI.")
+
 # ========== Automated Background Scanner Loop ==========
 def auto_monitor_loop(bot):
     logger.info("⚡ Auto Monitor loop started for Amazon SA...")
@@ -293,6 +308,12 @@ def main():
     flask_thread.start()
     
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    
+    # إضافة معالجات الأوامر للرد عند مراسلة البوت
+    dp.add_handler(CommandHandler("start", start_command))
+    dp.add_handler(CommandHandler("test", test_command))
+    
     bot = updater.bot
     
     monitor_thread = threading.Thread(target=auto_monitor_loop, args=(bot,), daemon=True)
