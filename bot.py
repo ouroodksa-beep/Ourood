@@ -26,7 +26,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "432826122")
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 PORT = int(os.environ.get("PORT", 8080))
 
-SUPER_DISCOUNT_THRESHOLD = 70.0  # إرسال لو الخصم 50% أو أكثر
+SUPER_DISCOUNT_THRESHOLD = 50.0  # إرسال لو الخصم 50% أو أكثر
 AVERAGE_DISCOUNT_THRESHOLD = 40.0 # إرسال لو انخفض 40% عن المتوسط
 
 # ========== Flask Server ==========
@@ -129,14 +129,23 @@ def update_product_and_check(deal):
     conn.close()
     return should_send, reason
 
-# ========== Amazon Categories & Links Setup ==========
+# ========== Amazon Custom Links Setup ==========
 CATEGORIES_AMAZON = [
-    ("https://www.amazon.sa/-/en/tez/browse/?_encoding=UTF8&qcbrand=sAuWWBROaG&ref_=mwb_sn_logo_yalla", "🚀 Amazon Yalla / Now"),
-    ("https://www.amazon.sa/s?k=deals", "🔥 Amazon Today's Deals"),
-    ("https://www.amazon.sa/gp/bestsellers/beauty/", "💄 Beauty Best Seller"),
-    ("https://www.amazon.sa/gp/bestsellers/kitchen/", "🍳 Kitchen Best Seller"),
-    ("https://www.amazon.sa/gp/bestsellers/mobile-phones/", "📱 Mobile Best Seller"),
-    ("https://www.amazon.sa/gp/bestsellers/supermarket/", "🛒 Supermarket Best Seller")
+    ("https://www.amazon.sa/-/en/b?_encoding=UTF8&node=12462934031&ref_=cct_cg_aeappsbc_5a1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "💄 Beauty Section"),
+    ("https://www.amazon.sa/-/en/s?_encoding=UTF8&i=fashion&k=bags&ref_=cct_cg_aeappsbc_4f1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "👜 Fashion Bags"),
+    ("https://www.amazon.sa/-/en/b?_encoding=UTF8&node=12463618031&ref_=cct_cg_aeappsbc_5b1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "🌸 Perfumes Category"),
+    ("https://www.amazon.sa/-/en/b?_encoding=UTF8&node=12463276031&ref_=cct_cg_aeappsbc_4e1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "🍳 Kitchen Category"),
+    ("https://www.amazon.sa/-/en/b?_encoding=UTF8&node=21023214031&ref_=cct_cg_aeappsbc_4d1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "🏠 Home Appliances"),
+    ("https://www.amazon.sa/-/en/b?_encoding=UTF8&node=20509033031&ref_=cct_cg_aeappsbc_3a1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "💻 Computers Category"),
+    ("https://www.amazon.sa/fmc/global-store?_encoding=UTF8&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF&ref_=cct_cg_aeappsbc_2c1", "🌐 Global Store"),
+    ("https://www.amazon.sa/deals?_encoding=UTF8&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF&ref_=cct_cg_aeappsbc_2b1&bubble-id=deals-collection-coupons", "🎟️ Coupons Collection"),
+    ("https://www.amazon.sa/-/en/gp/goldbox?ie=UTF8&ref_=cct_cg_aeappsbc_2a1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "⚡ Today's Goldbox Deals"),
+    ("https://www.amazon.sa/-/en/b?_encoding=UTF8&node=12462991031&ref_=cct_cg_aeappsbc_3b1&pf_rd_p=5bca21fd-7cc6-43e6-948c-8c49601e6be9&pf_rd_r=BA46M7Q8N5YER6QMP1HF", "📱 Mobile Category"),
+    ("https://www.amazon.sa/-/en/gp/browse.html?node=26031445031&ref_=navm_em_allpf_outlet_0_1_1_11", "🏷️ Outlet Clearance"),
+    ("https://www.amazon.sa/-/en/gp/bestsellers/?ref_=navm_em_cs_bestsellers_0_1_1_2", "🏆 Best Sellers Main"),
+    ("https://www.amazon.sa/-/en/deals/?_encoding=UTF8&ref_=sa_cat_halo_bau_deals_D", "🔥 Halo Deals"),
+    ("https://www.amazon.sa/-/en/tez/browse/?_encoding=UTF8&qcbrand=sAuWWBROaG&ref_=sa_cat_halo_now", "🚀 Amazon Yalla / Now"),
+    ("https://www.amazon.sa/gp/bestsellers/supermarket/", "🛒 Supermarket Best Sellers")
 ]
 
 def fetch_amazon_category(target_url, category_name):
@@ -156,15 +165,13 @@ def fetch_amazon_category(target_url, category_name):
         
         if r.status_code == 200:
             soup = BeautifulSoup(r.text, 'html.parser')
-            # البحث عن عناصر المنتجات ببطاقات أمازون المتنوعة
             items = soup.find_all('div', {'data-component-type': 's-search-result'}) or soup.find_all('div', id=re.compile(r'grid-item'))
             
             if not items:
-                items = soup.find_all('div', class_=re.compile(r'a-cardui|p13n-grid-content'))
+                items = soup.find_all('div', class_=re.compile(r'a-cardui|p13n-grid-content|a-section'))
 
             for item in items:
                 try:
-                    # ASIN والرابط
                     asin = item.get('data-asin')
                     link_tag = item.find('a', class_=re.compile(r'a-link-normal'), href=True)
                     if not link_tag:
@@ -177,11 +184,9 @@ def fetch_amazon_category(target_url, category_name):
 
                     link = f"https://www.amazon.sa{href}" if href.startswith('/') else href
 
-                    # العنوان
                     title_tag = item.find('h2') or item.find('span', class_=re.compile(r'a-text-normal|p13n-sc-truncate'))
                     title = title_tag.text.strip() if title_tag else "منتج أمازون"
 
-                    # السعر
                     price_whole = item.find('span', class_='a-price-whole')
                     price_fraction = item.find('span', class_='a-price-fraction')
                     
@@ -193,7 +198,6 @@ def fetch_amazon_category(target_url, category_name):
                         p_str += "." + price_fraction.text.strip()
                     price = float(re.sub(r'[^\d.]', '', p_str))
 
-                    # السعر الأصلي
                     old_price_tag = item.find('span', class_='a-price a-text-price') or item.find('span', class_='a-offscreen')
                     old_price = price
                     if old_price_tag:
@@ -210,7 +214,6 @@ def fetch_amazon_category(target_url, category_name):
                     if old_price > price:
                         discount = int(((old_price - price) / old_price) * 100)
 
-                    # الصورة
                     img_tag = item.find('img', class_=re.compile(r's-image|a-dynamic-image'))
                     img = img_tag['src'] if img_tag and 'src' in img_tag.attrs else ""
 
