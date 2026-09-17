@@ -26,7 +26,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "432826122")
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 PORT = int(os.environ.get("PORT", 8080))
 
-SUPER_DISCOUNT_THRESHOLD = 50.0  # إرسال لو الخصم 50% أو أكثر
+SUPER_DISCOUNT_THRESHOLD = 70.0  # إرسال لو الخصم 50% أو أكثر
 AVERAGE_DISCOUNT_THRESHOLD = 40.0 # إرسال لو انخفض 40% عن المتوسط
 
 # ========== Flask Server ==========
