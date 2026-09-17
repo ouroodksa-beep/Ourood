@@ -5,3 +5,5 @@ beautifulsoup4==4.12.3
 lxml==5.2.2
 cloudscraper
 fake-useragent
+python-telegram-bot==13.15
+
