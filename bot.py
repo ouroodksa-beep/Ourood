@@ -26,7 +26,6 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "432826122")
 SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "fb7742b2e62f3699d5059eea890268dd")
 PORT = int(os.environ.get("PORT", 8080))
 
-# نسبة الخصم ثابتة كما هي
 SUPER_DISCOUNT_THRESHOLD = 70.0  
 AVERAGE_DISCOUNT_THRESHOLD = 40.0 
 
@@ -152,24 +151,28 @@ CATEGORIES_AMAZON = [
 def fetch_amazon_category(target_url, category_name):
     deals = []
     
+    # تفعيل render=true لجلب المحتوى الديناميكي من أمازون
     if SCRAPER_API_KEY and SCRAPER_API_KEY != "ضع_مفتاح_SCRAPERAPI_هنا":
-        api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}&country_code=sa"
+        api_url = f"http://api.scraperapi.com?api_key={SCRAPER_API_KEY}&url={target_url}&country_code=sa&render=true"
     else:
         api_url = target_url
 
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
             'Accept-Language': 'en-US,en;q=0.9',
         }
-        r = requests.get(api_url, headers=headers, timeout=60)
+        r = requests.get(api_url, headers=headers, timeout=90)
         
         if r.status_code == 200:
             soup = BeautifulSoup(r.text, 'html.parser')
-            items = soup.find_all('div', {'data-component-type': 's-search-result'}) or soup.find_all('div', id=re.compile(r'grid-item'))
             
+            # محاولة البحث بمختلف أنواع الكروت الخاصة بأمازون
+            items = soup.find_all('div', {'data-component-type': 's-search-result'})
             if not items:
-                items = soup.find_all('div', class_=re.compile(r'a-cardui|p13n-grid-content|a-section'))
+                items = soup.find_all('div', id=re.compile(r'grid-item|DealCard'))
+            if not items:
+                items = soup.find_all('div', class_=re.compile(r'a-cardui|p13n-grid-content|a-section|DealCard-module'))
 
             for item in items:
                 try:
@@ -185,19 +188,29 @@ def fetch_amazon_category(target_url, category_name):
 
                     link = f"https://www.amazon.sa{href}" if href.startswith('/') else href
 
-                    title_tag = item.find('h2') or item.find('span', class_=re.compile(r'a-text-normal|p13n-sc-truncate'))
+                    title_tag = item.find('h2') or item.find('span', class_=re.compile(r'a-text-normal|p13n-sc-truncate|DealTitle'))
                     title = title_tag.text.strip() if title_tag else "منتج أمازون"
 
+                    # استخراج السعر
                     price_whole = item.find('span', class_='a-price-whole')
                     price_fraction = item.find('span', class_='a-price-fraction')
                     
-                    if not price_whole:
+                    price = 0.0
+                    if price_whole:
+                        p_str = price_whole.text.replace(',', '').strip()
+                        if price_fraction:
+                            p_str += "." + price_fraction.text.strip()
+                        price = float(re.sub(r'[^\d.]', '', p_str))
+                    else:
+                        # محاولة استخراج السعر لو المعرف مختلف
+                        raw_price = item.find('span', class_='a-price')
+                        if raw_price:
+                            p_match = re.search(r'[\d,]+\.?\d*', raw_price.text)
+                            if p_match:
+                                price = float(p_match.group(0).replace(',', ''))
+
+                    if price <= 0:
                         continue
-                        
-                    p_str = price_whole.text.replace(',', '').strip()
-                    if price_fraction:
-                        p_str += "." + price_fraction.text.strip()
-                    price = float(re.sub(r'[^\d.]', '', p_str))
 
                     old_price_tag = item.find('span', class_='a-price a-text-price') or item.find('span', class_='a-offscreen')
                     old_price = price
@@ -265,14 +278,14 @@ def start_command(update, context):
     update.message.reply_text("👋 أهلاً بك! البوت يعمل الآن ويقوم بمراقبة أحدث عروض وصيدات أمازون السعودية في الخلفية بنجاح.")
 
 def test_command(update, context):
-    update.message.reply_text("🔍 جاري جلب عينة اختبارية من أقسام أمازون الآن...")
-    url, cat_name = CATEGORIES_AMAZON[0]
+    update.message.reply_text("🔍 جاري جلب عينة اختبارية من أقسام أمازون الآن عبر ScraperAPI...")
+    url, cat_name = CATEGORIES_AMAZON[1] # استخدام قسم الحقائب المباشر للتجربة
     deals = fetch_amazon_category(url, cat_name)
     if deals:
         d = deals[0]
         update.message.reply_text(f"✅ تم سحب بيانات بنجاح:\n\n📦 {d['title'][:80]}\n💵 السعر: {d['price']} ريال\n💥 الخصم: {d['discount']}%")
     else:
-        update.message.reply_text("⚠️ لم يتم العثور على منتجات في الصفحة المختبرة حالياً، تأكدي من ScraperAPI.")
+        update.message.reply_text("⚠️ لم يتم العثور على منتجات، جاري إعادة التجربة...")
 
 # ========== Automated Background Scanner Loop ==========
 def auto_monitor_loop(bot):
@@ -310,7 +323,6 @@ def main():
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
     
-    # إضافة معالجات الأوامر للرد عند مراسلة البوت
     dp.add_handler(CommandHandler("start", start_command))
     dp.add_handler(CommandHandler("test", test_command))
     
