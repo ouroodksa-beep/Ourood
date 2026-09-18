@@ -65,7 +65,6 @@ sent_hashes = set()
 price_history = {}
 
 MIN_DISCOUNT = 70
-MIN_RATING = 3.5
 
 # ========== نظام تدوير الصفحات ==========
 class PageRotationManager:
@@ -185,7 +184,7 @@ def export_to_excel(deals):
     try:
         excel_file = 'amazon_deals.xlsx'
         df_new = pd.DataFrame(deals)
-        cols_to_keep = ['title', 'price', 'old_price', 'discount', 'rating', 'reviews', 'category', 'type', 'link', 'id']
+        cols_to_keep = ['title', 'price', 'old_price', 'discount', 'category', 'type', 'link', 'id']
         df_new = df_new[[c for c in cols_to_keep if c in df_new.columns]]
         df_new['date_added'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -232,12 +231,6 @@ def get_product_id(deal):
         return f"ASIN_{asin}"
     key = f"{deal.get('title', '')}_{deal.get('price', 0)}"
     return f"HASH_{hashlib.md5(key.encode()).hexdigest()[:12]}"
-
-def parse_rating(text):
-    if not text:
-        return 0
-    match = re.search(r'(\d+\.?\d*)', str(text))
-    return float(match.group(1)) if match else 0
 
 def create_session():
     session = cloudscraper.create_scraper(
@@ -290,11 +283,12 @@ def update_price_history_and_check_resend(deal):
     return avg_discount <= 40
 
 def is_valid_deal(deal):
-    if deal['discount'] < MIN_DISCOUNT or deal['rating'] < MIN_RATING or deal['price'] <= 0:
+    if deal['discount'] < MIN_DISCOUNT or deal['price'] <= 0:
         return False
     return True
 
 def parse_item(item, category, is_best_seller):
+    # 1. استخراج السعر الحالي
     price = None
     for sel in ['.a-price-whole', '.a-price .a-offscreen', '.a-price']:
         el = item.select_one(sel)
@@ -303,31 +297,42 @@ def parse_item(item, category, is_best_seller):
                 txt = el.text.replace(',', '').replace('ريال', '').strip()
                 match = re.search(r'[\d,]+\.?\d*', txt)
                 if match:
-                    price = float(match.group().replace(',', ''))
-                    break
-            except:
+                    val_str = match.group().replace(',', '')
+                    if val_str:
+                        price = float(val_str)
+                        break
+            except Exception:
                 pass
-    if not price:
+    if not price or price <= 0:
         return None
 
+    # 2. استخراج السعر القديم والخصم بدقة
     old_price = 0
     discount = 0
     old_el = item.find('span', class_='a-text-price')
     if old_el:
-        match = re.search(r'[\d,]+\.?\d*', old_el.get_text().replace(',', ''))
-        if match:
-            old_price = float(match.group())
-            if old_price > price:
-                discount = int(((old_price - price) / old_price) * 100)
+        try:
+            match = re.search(r'[\d,]+\.?\d*', old_el.get_text().replace(',', ''))
+            if match and match.group():
+                old_price = float(match.group())
+                if old_price > price:
+                    discount = int(((old_price - price) / old_price) * 100)
+        except Exception:
+            pass
 
     if discount == 0:
         badge = item.find(string=re.compile(r'(\d+)%'))
         if badge:
-            match = re.search(r'(\d+)', str(badge))
-            if match:
-                discount = int(match.group())
-                old_price = price / (1 - discount/100)
+            try:
+                match = re.search(r'(\d+)', str(badge))
+                if match and match.group():
+                    discount = int(match.group())
+                    if discount < 100:
+                        old_price = price / (1 - discount / 100)
+            except Exception:
+                pass
 
+    # 3. استخراج العنوان
     title = "Unknown"
     for sel in ['h2 a span', 'h2 span', '.a-size-mini span', '.a-size-base-plus']:
         el = item.select_one(sel)
@@ -335,40 +340,19 @@ def parse_item(item, category, is_best_seller):
             title = el.text.strip()
             break
 
+    # 4. استخراج الرابط
     link = ""
     a = item.find('a', href=True)
     if a:
         href = a['href']
         link = f"https://www.amazon.sa{href}" if href.startswith('/') else href
 
-    img = ""
-    for sel in ['img.s-image', '.s-image']:
-        el = item.select_one(sel)
-        if el:
-            img = el.get('src', '') or el.get('data-src', '')
-            if img.startswith('http'):
-                break
-
-    rating, reviews = 0, 0
-    rate_el = item.find('span', class_='a-icon-alt')
-    if rate_el:
-        rating = parse_rating(rate_el.text)
-
-    rev_el = item.find('span', class_='a-size-base')
-    if rev_el:
-        match = re.search(r'[\d,]+', rev_el.text)
-        if match:
-            reviews = int(match.group().replace(',', ''))
-
     return {
         'title': title,
         'price': price,
         'old_price': round(old_price, 2),
         'discount': discount,
-        'rating': rating,
-        'reviews': reviews,
         'link': link,
-        'image': img,
         'category': category,
         'is_best_seller': is_best_seller,
         'id': get_product_id({'title': title, 'link': link, 'price': price})
@@ -399,16 +383,13 @@ def send_deal(bot, deal):
 
 💵 *{deal['price']:.2f} ريال*
 {old_txt}{sav_txt}📉 خصم: {deal['discount']}%
-⭐ تقييم: {deal['rating']}/5
 📍 {deal['category']}
 
 🔗 [عرض المنتج على Amazon]({deal['link']})
     """
     try:
-        if deal['image'].startswith('http'):
-            bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=deal['image'], caption=msg, parse_mode='Markdown')
-        else:
-            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
+        # إرسال الرسالة كنص فقط بدون صور
+        bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=msg, parse_mode='Markdown')
 
         sent_products.add(deal_id)
         sent_hashes.add(create_title_hash(deal['title']))
@@ -442,7 +423,6 @@ def auto_scan_and_send(bot):
                 for item in items:
                     deal = parse_item(item, page_info['category'], 'best_sellers' in page_info['type'])
                     if deal and is_valid_deal(deal):
-                        # إرسال فور العثور عليه
                         send_deal(bot, deal)
                 
                 time.sleep(random.uniform(2, 4))
@@ -477,7 +457,6 @@ def main():
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # تشغيل الفحص الآلي المستمر في Thread مستقل فور تشغيل البوت
     threading.Thread(target=auto_scan_and_send, args=(updater.bot,), daemon=True).start()
 
     dp.add_handler(CommandHandler("start", start_cmd))
