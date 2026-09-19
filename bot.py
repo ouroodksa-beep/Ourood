@@ -27,6 +27,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "8769441239:AAFUuBQcJ6xj-9q
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "432826122")
 PORT = int(os.environ.get("PORT", 8080))
 
+RESEND_COOLDOWN_DAYS = 7  # إعادة إرسال نفس المنتج بعد أسبوع فقط
+
 # ========== Flask App for Keep-Alive ==========
 app = Flask(__name__)
 
@@ -39,12 +41,12 @@ def health():
     stats = page_rotator.get_stats() if page_rotator.all_pages else {}
     return {
         "status": "ok",
-        "products": len(sent_products),
+        "products_sent": len(sent_log),
         "timestamp": datetime.now().isoformat(),
         "pages": stats.get('total_pages', 0),
         "visited": stats.get('visited_pages', 0),
-        "progress": stats.get('progress_percent', 0),
-        "rotation": stats.get('rotation_count', 0)
+        "remaining": stats.get('remaining_pages', 0),
+        "progress": stats.get('progress_percent', 0)
     }, 200
 
 def run_flask():
@@ -62,40 +64,45 @@ def keep_alive_ping():
 ua = UserAgent()
 sent_products = set()
 sent_hashes = set()
-price_history = {}
+sent_log = {}   # deal_id -> تاريخ آخر إرسال (منع الإعادة لأسبوع)
+hash_log = {}   # title_hash -> تاريخ آخر إرسال
 
 MIN_DISCOUNT = 70  # حد الخصم الأدنى 70%
 
-# ========== نظام تدوير الصفحات الشامل ==========
+# ========== نظام تدوير الصفحات الشامل (كل صفحة مرة واحدة فقط) ==========
 class PageRotationManager:
     def __init__(self):
-        self.visited_pages = set()
+        self.visited_pages = {}   # page_id -> timestamp الزيارة
         self.page_queue_amazon = deque()
         self.page_queue_now = deque()
         self.all_pages = []
         self.rotation_count = 0
-        
+
     def load_state(self):
         try:
             if os.path.exists('page_rotation.json'):
                 with open('page_rotation.json', 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    self.visited_pages = set(data.get('visited', []))
+                    v = data.get('visited', {})
+                    if isinstance(v, list):  # توافق مع الصيغة القديمة
+                        self.visited_pages = {p: datetime.now().isoformat() for p in v}
+                    else:
+                        self.visited_pages = v
                     self.rotation_count = data.get('rotation_count', 0)
         except Exception as e:
             logger.error(f"Error loading rotation state: {e}")
-    
+
     def save_state(self):
         try:
             with open('page_rotation.json', 'w', encoding='utf-8') as f:
                 json.dump({
-                    'visited': list(self.visited_pages),
+                    'visited': self.visited_pages,
                     'rotation_count': self.rotation_count,
                     'last_update': datetime.now().isoformat()
                 }, f)
         except Exception as e:
             logger.error(f"Error saving rotation state: {e}")
-    
+
     def generate_all_pages(self, categories):
         self.all_pages = []
         for base_url, cat_name, cat_type in categories:
@@ -112,64 +119,100 @@ class PageRotationManager:
                     'base_url': base_url
                 })
         self._refill_queues()
+        logger.info(f"📚 Generated {len(self.all_pages)} pages from {len(categories)} categories")
         return self.all_pages
-    
+
     def _build_page_url(self, base_url, page_num):
         if page_num == 1:
             return base_url
         separator = '&' if '?' in base_url else '?'
         return f"{base_url}{separator}page={page_num}" if 's?' in base_url else f"{base_url}{separator}pg={page_num}"
-    
+
     def _refill_queues(self):
-        amazon_pages = [p for p in self.all_pages if not p['type'].startswith('now')]
-        now_pages = [p for p in self.all_pages if p['type'].startswith('now')]
-        
+        # عبّي الصفوف بالصفحات اللي لسه متزارتش فقط
+        amazon_pages = [p for p in self.all_pages if not p['type'].startswith('now') and p['id'] not in self.visited_pages]
+        now_pages = [p for p in self.all_pages if p['type'].startswith('now') and p['id'] not in self.visited_pages]
+
         random.shuffle(amazon_pages)
         random.shuffle(now_pages)
-        
+
         self.page_queue_amazon = deque(amazon_pages)
         self.page_queue_now = deque(now_pages)
 
+    def has_unvisited(self):
+        return any(p['id'] not in self.visited_pages for p in self.all_pages)
+
     def get_balanced_batch(self, batch_size=10):
-        """تجهيز دفعة متوازنة بالنصف بين أمازون العادي وأمازون ناو"""
+        """دفعة متوازنة من صفحات جديدة تماماً (مش متزورة قبل كده)"""
         batch = []
         half = batch_size // 2
-        
-        # أخذ صفحات من أمازون العادي
-        for _ in range(half):
-            if not self.page_queue_amazon:
-                self._refill_queues()
-            if self.page_queue_amazon:
-                batch.append(self.page_queue_amazon.popleft())
 
-        # أخذ صفحات من أمازون ناو
         for _ in range(half):
-            if not self.page_queue_now:
-                self._refill_queues()
-            if self.page_queue_now:
-                batch.append(self.page_queue_now.popleft())
+            while self.page_queue_amazon:
+                page = self.page_queue_amazon.popleft()
+                if page['id'] not in self.visited_pages:
+                    batch.append(page)
+                    break
+
+        for _ in range(half):
+            while self.page_queue_now:
+                page = self.page_queue_now.popleft()
+                if page['id'] not in self.visited_pages:
+                    batch.append(page)
+                    break
 
         return batch
-    
+
+    def mark_visited(self, page_id):
+        """تسجيل الصفحة كمتزورة - مش هنرجع لها تاني"""
+        self.visited_pages[page_id] = datetime.now().isoformat()
+        self.save_state()
+
+    def reset_old_visits(self):
+        """إعادة فتح الصفحات اللي فات عليها أسبوع أو أكتر"""
+        now = datetime.now()
+        try:
+            old = [pid for pid, ts in self.visited_pages.items()
+                   if (now - datetime.fromisoformat(ts)).days >= RESEND_COOLDOWN_DAYS]
+        except Exception:
+            old = list(self.visited_pages.keys())
+        for pid in old:
+            del self.visited_pages[pid]
+        if old:
+            self.rotation_count += 1
+            self._refill_queues()
+            self.save_state()
+            logger.info(f"🔄 Weekly reset: reopened {len(old)} pages")
+        return len(old)
+
     def get_stats(self):
+        visited = len(self.visited_pages)
+        total = len(self.all_pages)
         return {
-            'total_pages': len(self.all_pages),
-            'visited_pages': len(self.visited_pages),
-            'progress_percent': (len(self.visited_pages) / len(self.all_pages) * 100) if self.all_pages else 0,
+            'total_pages': total,
+            'visited_pages': visited,
+            'remaining_pages': max(0, total - visited),
+            'progress_percent': (visited / total * 100) if total else 0,
             'rotation_count': self.rotation_count
         }
 
 page_rotator = PageRotationManager()
 
 def load_database():
-    global sent_products, sent_hashes, price_history
+    global sent_products, sent_hashes, sent_log, hash_log
     try:
         if os.path.exists('bot_database.json'):
             with open('bot_database.json', 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                sent_products = set(data.get('ids', []))
-                sent_hashes = set(data.get('hashes', []))
-                price_history = data.get('price_history', {})
+                sent_log = data.get('sent_log', {})
+                hash_log = data.get('hash_log', {})
+                # توافق مع النسخة القديمة (بدون تواريخ)
+                if not sent_log and data.get('ids'):
+                    sent_log = {i: datetime.now().isoformat() for i in data.get('ids', [])}
+                if not hash_log and data.get('hashes'):
+                    hash_log = {h: datetime.now().isoformat() for h in data.get('hashes', [])}
+                sent_products = set(sent_log.keys())
+                sent_hashes = set(hash_log.keys())
     except Exception as e:
         logger.error(f"Error loading DB: {e}")
 
@@ -177,9 +220,8 @@ def save_database():
     try:
         with open('bot_database.json', 'w', encoding='utf-8') as f:
             json.dump({
-                'ids': list(sent_products),
-                'hashes': list(sent_hashes),
-                'price_history': price_history
+                'sent_log': sent_log,
+                'hash_log': hash_log
             }, f)
     except Exception as e:
         logger.error(f"Error saving DB: {e}")
@@ -223,18 +265,32 @@ def create_title_hash(title):
         clean = clean.replace(word, '')
     return hashlib.md5(clean[:30].strip().encode()).hexdigest()[:16]
 
-def is_similar_product(title):
-    new_hash = create_title_hash(title)
-    if new_hash in sent_hashes:
-        return True
-    return False
-
 def get_product_id(deal):
     asin = extract_asin(deal.get('link', ''))
     if asin:
         return f"ASIN_{asin}"
     key = f"{deal.get('title', '')}_{deal.get('price', 0)}"
     return f"HASH_{hashlib.md5(key.encode()).hexdigest()[:12]}"
+
+def is_on_cooldown(deal_id, title):
+    """ممنوع إعادة الإرسال إلا بعد أسبوع (7 أيام)"""
+    now = datetime.now()
+    ts = sent_log.get(deal_id)
+    if ts:
+        try:
+            if (now - datetime.fromisoformat(ts)).days < RESEND_COOLDOWN_DAYS:
+                return True
+        except Exception:
+            pass
+    h = create_title_hash(title)
+    hts = hash_log.get(h)
+    if hts:
+        try:
+            if (now - datetime.fromisoformat(hts)).days < RESEND_COOLDOWN_DAYS:
+                return True
+        except Exception:
+            pass
+    return False
 
 def create_session():
     session = cloudscraper.create_scraper(
@@ -267,7 +323,7 @@ PAGES_CONFIG = {
     'outlet': 3,
     'clearance': 4,
     'now': 5,
-    'now_grocery': 5,
+    'now_grocery': 4,
     'now_supermarket': 5,
     'now_fruits': 4,
     'now_vegetables': 4,
@@ -282,6 +338,9 @@ PAGES_CONFIG = {
     'now_cleaning': 4,
     'now_personal_care': 4,
     'now_daily_deals': 5,
+    'now_breakfast': 4,
+    'now_pantry': 4,
+    'dept': 4,        # الأقسام العامة الجديدة
 }
 
 CATEGORIES_DEF = [
@@ -290,34 +349,52 @@ CATEGORIES_DEF = [
     ("https://www.amazon.sa/s?k=amazon+now&rh=p_8%3A70-", "⚡ Amazon Now Deals", 'now_daily_deals'),
     ("https://www.amazon.sa/s?k=supermarket&rh=p_8%3A70-", "🛒 Supermarket Deals", 'now_supermarket'),
     ("https://www.amazon.sa/s?k=groceries&rh=p_8%3A70-", "🛒 Groceries 70% Off", 'now_grocery'),
-    ("https://www.amazon.sa/s?k=fruits&rh=p_8%3A70-", "🍎 Fruits & Vegetables", 'now_fruits'),
+    ("https://www.amazon.sa/s?k=fruits&rh=p_8%3A70-", "🍎 Fruits", 'now_fruits'),
+    ("https://www.amazon.sa/s?k=vegetables&rh=p_8%3A70-", "🥬 Vegetables", 'now_vegetables'),
+    ("https://www.amazon.sa/s?k=meat&rh=p_8%3A70-", "🥩 Meat & Poultry", 'now_meat'),
     ("https://www.amazon.sa/s?k=dairy&rh=p_8%3A70-", "🥛 Dairy & Eggs", 'now_dairy'),
+    ("https://www.amazon.sa/s?k=bakery&rh=p_8%3A70-", "🍞 Bakery", 'now_bakery'),
+    ("https://www.amazon.sa/s?k=frozen&rh=p_8%3A70-", "🧊 Frozen Food", 'now_frozen'),
+    ("https://www.amazon.sa/s?k=drinks&rh=p_8%3A70-", "🥤 Drinks & Beverages", 'now_drinks'),
+    ("https://www.amazon.sa/s?k=snacks&rh=p_8%3A70-", "🍿 Snacks", 'now_snacks'),
+    ("https://www.amazon.sa/s?k=baby+food&rh=p_8%3A70-", "👶 Baby Food", 'now_baby'),
+    ("https://www.amazon.sa/s?k=pet+food&rh=p_8%3A70-", "🐾 Pet Food", 'now_pet_food'),
     ("https://www.amazon.sa/s?k=cleaning&rh=p_8%3A70-", "🧼 Cleaning Products", 'now_cleaning'),
     ("https://www.amazon.sa/s?k=personal+care&rh=p_8%3A70-", "🧴 Personal Care", 'now_personal_care'),
+    ("https://www.amazon.sa/s?k=breakfast&rh=p_8%3A70-", "🥣 Breakfast & Cereal", 'now_breakfast'),
+    ("https://www.amazon.sa/s?k=rice+and+pasta&rh=p_8%3A70-", "🍚 Rice & Pasta", 'now_pantry'),
 
     # ==== عروض أمازون العامة ====
     ("https://www.amazon.sa/s?rh=p_8%3A70-99", "🔥 All Deals 70% Off", 'deals'),
     ("https://www.amazon.sa/gp/goldbox", "🔥 Goldbox Today Deals", 'deals'),
+    ("https://www.amazon.sa/gp/warehouse-deals", "🏭 Warehouse Deals", 'warehouse'),
+    ("https://www.amazon.sa/outlet", "🎁 Outlet Store", 'outlet'),
+
+    # ==== Best Sellers ====
     ("https://www.amazon.sa/gp/bestsellers/electronics", "📱 Electronics Best Seller", 'best_sellers'),
     ("https://www.amazon.sa/gp/bestsellers/fashion", "👕 Fashion Best Seller", 'best_sellers'),
     ("https://www.amazon.sa/gp/bestsellers/beauty", "💄 Beauty Best Seller", 'best_sellers'),
     ("https://www.amazon.sa/gp/bestsellers/grocery", "🥫 Grocery Best Seller", 'best_sellers'),
     ("https://www.amazon.sa/gp/bestsellers/home", "🏠 Home Best Seller", 'best_sellers'),
-    ("https://www.amazon.sa/gp/warehouse-deals", "🏭 Warehouse Deals", 'warehouse'),
-    ("https://www.amazon.sa/outlet", "🎁 Outlet Store", 'outlet'),
-]
 
-def update_price_history_and_check_resend(deal):
-    deal_id = deal['id']
-    curr_discount = deal['discount']
-    
-    if deal_id not in price_history:
-        price_history[deal_id] = [curr_discount]
-        return False
-    
-    price_history[deal_id].append(curr_discount)
-    avg_discount = sum(price_history[deal_id]) / len(price_history[deal_id])
-    return avg_discount <= 40
+    # ==== أقسام جديدة (خصم 70%+) ====
+    ("https://www.amazon.sa/s?k=toys&rh=p_8%3A70-", "🧸 Toys & Games", 'dept'),
+    ("https://www.amazon.sa/s?k=sports&rh=p_8%3A70-", "⚽ Sports & Outdoors", 'dept'),
+    ("https://www.amazon.sa/s?k=kitchen&rh=p_8%3A70-", "🍳 Kitchen & Dining", 'dept'),
+    ("https://www.amazon.sa/s?k=tools&rh=p_8%3A70-", "🔧 Tools & DIY", 'dept'),
+    ("https://www.amazon.sa/s?k=car+accessories&rh=p_8%3A70-", "🚗 Car Accessories", 'dept'),
+    ("https://www.amazon.sa/s?k=baby+products&rh=p_8%3A70-", "🍼 Baby Products", 'dept'),
+    ("https://www.amazon.sa/s?k=pet+supplies&rh=p_8%3A70-", "🐕 Pet Supplies", 'dept'),
+    ("https://www.amazon.sa/s?k=office+supplies&rh=p_8%3A70-", "📎 Office Supplies", 'dept'),
+    ("https://www.amazon.sa/s?k=perfume&rh=p_8%3A70-", "🌸 Perfumes 70% Off", 'dept'),
+    ("https://www.amazon.sa/s?k=watches&rh=p_8%3A70-", "⌚ Watches 70% Off", 'dept'),
+    ("https://www.amazon.sa/s?k=phone+accessories&rh=p_8%3A70-", "📱 Phone Accessories", 'dept'),
+    ("https://www.amazon.sa/s?k=gaming&rh=p_8%3A70-", "🎮 Gaming Deals", 'dept'),
+    ("https://www.amazon.sa/s?k=home+appliances&rh=p_8%3A70-", "🔌 Home Appliances", 'dept'),
+    ("https://www.amazon.sa/s?k=home+improvement&rh=p_8%3A70-", "🏡 Home Improvement", 'dept'),
+    ("https://www.amazon.sa/s?k=hair+care&rh=p_8%3A70-", "💇 Hair Care", 'dept'),
+    ("https://www.amazon.sa/s?k=skin+care&rh=p_8%3A70-", "✨ Skin Care", 'dept'),
+]
 
 def is_valid_deal(deal):
     if deal['discount'] < MIN_DISCOUNT or deal['price'] <= 0 or deal['old_price'] <= deal['price']:
@@ -399,24 +476,24 @@ def parse_item(item, category, is_best_seller):
 
 def send_deal(bot, deal, target_chat_id=None):
     global sent_products, sent_hashes
-    
+
     chat_id = target_chat_id or TELEGRAM_CHAT_ID
     deal_id = deal['id']
-    should_resend = update_price_history_and_check_resend(deal)
-    
-    if (deal_id in sent_products or is_similar_product(deal['title'])) and not should_resend and not target_chat_id:
+
+    # ممنوع إعادة الإرسال قبل مرور أسبوع
+    if is_on_cooldown(deal_id, deal['title']):
         return False
 
     deal_type = f"💰 {deal['discount']}%"
     if 'Warehouse' in deal['category']: deal_type = '🏭 WAREHOUSE'
-    elif 'Amazon Now' in deal['category'] or 'Now ' in deal['category'] or 'Fresh' in deal['category'] or 'Grocery' in deal['category'] or 'Supermarket' in deal['category']:
+    elif 'Amazon Now' in deal['category'] or 'Now ' in deal['category'] or 'Fresh' in deal['category'] or 'Grocery' in deal['category'] or 'Supermarket' in deal['category'] or 'Fruits' in deal['category'] or 'Vegetables' in deal['category'] or 'Meat' in deal['category'] or 'Dairy' in deal['category'] or 'Bakery' in deal['category'] or 'Frozen' in deal['category'] or 'Drinks' in deal['category'] or 'Snacks' in deal['category'] or 'Breakfast' in deal['category'] or 'Rice' in deal['category'] or 'Baby Food' in deal['category'] or 'Pet Food' in deal['category']:
         deal_type = '⚡ AMAZON NOW'
     elif deal['is_best_seller']: deal_type = '⭐ BEST SELLER'
 
     savings = round(deal['old_price'] - deal['price'], 2)
     sav_txt = f"💵 توفير: {savings:.2f} ريال\n" if savings > 0 else ""
     old_txt = f"🏷️ قبل: {deal['old_price']:.2f} ريال\n" if deal['old_price'] > 0 else ""
-    
+
     msg = f"""
 {deal_type} *🔥 عرض جديد!*
 
@@ -431,10 +508,14 @@ def send_deal(bot, deal, target_chat_id=None):
     try:
         bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown')
 
+        now_iso = datetime.now().isoformat()
+        h = create_title_hash(deal['title'])
         sent_products.add(deal_id)
-        sent_hashes.add(create_title_hash(deal['title']))
+        sent_hashes.add(h)
+        sent_log[deal_id] = now_iso      # تسجيل تاريخ الإرسال (لمنع الإعادة لأسبوع)
+        hash_log[h] = now_iso
         save_database()
-        export_to_excel([deal])
+        export_to_excel([deal])          # تسجيل في الشيت مرة واحدة
         logger.info(f"✅ Sent Deal: {deal['title'][:30]} - Discount: {deal['discount']}%")
         return True
     except Exception as e:
@@ -442,16 +523,21 @@ def send_deal(bot, deal, target_chat_id=None):
         return False
 
 def scan_batch_and_send(bot, target_chat_id=None, limit=10):
-    """دالة تقوم بفحص دفعة واحدة متوازنة من أمازون العادي وأمازون ناو"""
+    """فحص دفعة واحدة من صفحات جديدة تماماً (مش متزورة قبل كده)"""
     session = create_session()
     pages = page_rotator.get_balanced_batch(batch_size=limit)
     found_count = 0
 
+    if not pages:
+        return 0
+
     for page_info in pages:
         html = fetch_page(session, page_info['url'])
+        page_rotator.mark_visited(page_info['id'])  # الصفحة دي خلاص اتزارت، مش هنرجعلها
+
         if not html:
             continue
-        
+
         soup = BeautifulSoup(html, 'html.parser')
         items = soup.find_all('div', {'data-component-type': 's-search-result'})
         if not items:
@@ -464,18 +550,26 @@ def scan_batch_and_send(bot, target_chat_id=None, limit=10):
             if deal and is_valid_deal(deal):
                 if send_deal(bot, deal, target_chat_id=target_chat_id):
                     found_count += 1
-        
+
         time.sleep(random.uniform(1, 2))
     return found_count
 
 def auto_scan_and_send(bot):
-    """دالة الفحص التلقائي المستمر طوال اليوم"""
+    """الفحص التلقائي المستمر - كل صفحة مرة واحدة فقط، وبعد أسبوع بيتحدث كل حاجة"""
     if not page_rotator.all_pages:
         page_rotator.generate_all_pages(CATEGORIES_DEF)
         page_rotator.load_state()
 
     while True:
         try:
+            if not page_rotator.has_unvisited():
+                # كل الصفحات اتفحصت - استنى الأسبوع يعدي وبعدين افتحها من تاني
+                page_rotator.reset_old_visits()
+                if not page_rotator.has_unvisited():
+                    logger.info("✅ All pages visited. Waiting for weekly reset...")
+                    time.sleep(3600)  # كل ساعة بيشيك لو الأسبوع عدى
+                    continue
+
             scan_batch_and_send(bot)
             time.sleep(15)
         except Exception as e:
@@ -484,52 +578,67 @@ def auto_scan_and_send(bot):
 
 # ========== معالجة الأوامر والرسائل النصية ==========
 def start_cmd(update: Update, context: CallbackContext):
-    update.message.reply_text("🤖 أهلاً بك! البوت يعمل 24 ساعة للفحص التلقائي.\n\n💬 ابعت لي **\"هاي\"** في أي وقت وهبدأ أبحث لكِ فوراً عن أقوى العروض الحالية من أمازون وأمازون ناو!")
+    update.message.reply_text("🤖 أهلاً بك! البوت يعمل 24 ساعة للفحص التلقائي.\n\n💬 ابعت لي **\"هاي\"** في أي وقت وهبحث لك في صفحات جديدة تماماً عن أقوى العروض من أمازون وأمازون ناو!\n\n⏳ كل منتج بيترسل مرة واحدة بس ومبيترجعش إلا بعد أسبوع.")
 
 def status_cmd(update: Update, context: CallbackContext):
     stats = page_rotator.get_stats()
-    update.message.reply_text(f"📊 *حالة البوت:*\n\n📦 تم إرسال: {len(sent_products)} منتج\n📈 نسبة التدوير: {stats['progress_percent']:.1f}%\n🔄 دورات التدوير: {stats['rotation_count']}", parse_mode='Markdown')
+    update.message.reply_text(
+        f"📊 *حالة البوت:*\n\n"
+        f"📦 منتجات مبعوتة: {len(sent_log)}\n"
+        f"🚫 إعادة الإرسال بعد: {RESEND_COOLDOWN_DAYS} أيام\n"
+        f"📄 إجمالي الصفحات: {stats['total_pages']}\n"
+        f"✅ صفحات متفحوصة: {stats['visited_pages']}\n"
+        f"🔜 صفحات متبقية: {stats['remaining_pages']}\n"
+        f"📈 نسبة الفحص: {stats['progress_percent']:.1f}%",
+        parse_mode='Markdown'
+    )
 
 def clear_cmd(update: Update, context: CallbackContext):
     sent_products.clear()
     sent_hashes.clear()
+    sent_log.clear()
+    hash_log.clear()
+    page_rotator.visited_pages.clear()
+    page_rotator._refill_queues()
+    page_rotator.save_state()
     save_database()
-    update.message.reply_text("🗑️ تم مسح سجل الإرسال بنجاح!")
+    update.message.reply_text("🗑️ تم مسح كل السجلات! هيبدأ فحص جديد من الأول.")
 
 def handle_text_messages(update: Update, context: CallbackContext):
-    """الرد الفوري عند إرسال 'هاي' أو أي كلمة للبحث عن العروض"""
-    user_text = update.message.text.strip().lower()
+    """الرد الفوري - كل بحث في صفحات جديدة تماماً"""
     chat_id = update.message.chat_id
 
-    update.message.reply_text("🔎 أهلاً بك! جاري البحث فوراً عن أحدث العروض من أمازون وأمازون ناو بالتوازي... ⏳")
-    
-    # تشغيل عملية فحص سريعة ومخصصة للرد على المستخدم
+    # لو فيه صفحات قديمة فات عليها أسبوع، افتحها من تاني
+    page_rotator.reset_old_visits()
+
+    if not page_rotator.has_unvisited():
+        update.message.reply_text("✅ تم فحص جميع الصفحات حالياً! ⏳ الفحص بيتجدد تلقائياً بعد أسبوع من آخر زيارة لكل صفحة.")
+        return
+
+    update.message.reply_text("🔎 جاري البحث فوراً في صفحات جديدة تماماً من أمازون وأمازون ناو بالتوازي... ⏳")
+
     found = scan_batch_and_send(context.bot, target_chat_id=chat_id, limit=8)
-    
+
     if found == 0:
-        update.message.reply_text("👍 جاري استكمال الفحص، إذا ظهرت عروض جديدة بخصم أكثر من 70% سأرسلها لكِ فوراً!")
+        update.message.reply_text("👍 تم فحص الدفعة الحالية، مفيش عروض جديدة بخصم 70%+ دلوقتي. ابعتلي تاني وهفحصلك صفحات تانية جديدة!")
 
 def main():
     load_database()
-    
+
     page_rotator.generate_all_pages(CATEGORIES_DEF)
     page_rotator.load_state()
-    
+
     threading.Thread(target=run_flask, daemon=True).start()
     threading.Thread(target=keep_alive_ping, daemon=True).start()
 
     updater = Updater(TELEGRAM_BOT_TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # تشغيل الفحص المستمر طوال اليوم في الخفاء
     threading.Thread(target=auto_scan_and_send, args=(updater.bot,), daemon=True).start()
 
-    # تسجيل الأوامر والرسائل
     dp.add_handler(CommandHandler("start", start_cmd))
     dp.add_handler(CommandHandler("status", status_cmd))
     dp.add_handler(CommandHandler("clear", clear_cmd))
-    
-    # معالج الرسائل العادية (استجابة لكلمة هاي أو أي رسالة)
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_text_messages))
 
     logger.info("🤖 Telegram Bot ready & Scanning...")
